@@ -3326,6 +3326,28 @@ void apply_console_placement(const D3D12_RESOURCE_DESC* descs, UINT count, D3D12
     if (console.SizeInBytes >= info.SizeInBytes) info = console;
 }
 
+// Test-branch diagnostic: a slot 25 answer of UINT64_MAX, with the descriptions the PC device was given, once per
+// distinct (format, dimension, flags, layout, mips, samples).
+void log_refused_allocation(const D3D12_RESOURCE_DESC* descs, UINT count, bool console_abi) {
+    static std::mutex mutex;
+    static std::set<std::tuple<int, int, unsigned, unsigned, unsigned, unsigned>> seen;
+    const std::lock_guard lock(mutex);
+    for (UINT i = 0; i < count; ++i) {
+        const D3D12_RESOURCE_DESC& d = descs[i];
+        if (!seen.insert({int(d.Format), int(d.Dimension), unsigned(d.Flags), unsigned(d.Layout), unsigned(d.MipLevels),
+                          d.SampleDesc.Count})
+                 .second)
+            continue;
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 25 answered UINT64_MAX (%s form, %u desc(s)); desc %u: format %d dimension %d "
+                     "%llux%ux%u mips %u samples %u/%u alignment 0x%llx layout 0x%x flags 0x%x\n",
+                     console_abi ? "console" : "PC", count, i, int(d.Format), int(d.Dimension),
+                     static_cast<unsigned long long>(d.Width), d.Height, unsigned(d.DepthOrArraySize),
+                     unsigned(d.MipLevels), d.SampleDesc.Count, d.SampleDesc.Quality,
+                     static_cast<unsigned long long>(d.Alignment), unsigned(d.Layout), unsigned(d.Flags));
+    }
+}
+
 void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t a1, std::uint64_t visible_mask,
                                                 std::uint64_t count, const D3D12_RESOURCE_DESC* descs) {
     note_slot(25);
@@ -3351,6 +3373,7 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
     apply_console_placement(descs, desc_count, info, nullptr,
                             [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
+    if (info.SizeInBytes == UINT64_MAX && descs) log_refused_allocation(descs, desc_count, call.console_abi);
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
     return call.ret;
 }
