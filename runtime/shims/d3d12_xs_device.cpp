@@ -2509,6 +2509,10 @@ std::uint32_t argument_type(const D3D12_INDIRECT_ARGUMENT_DESC& arg) {
     return type;
 }
 
+// Test-branch diagnostic: a failing slot 41 signature, once per distinct (count, stride, result), with its types.
+void log_failed_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, std::uint64_t root_signature, HRESULT hr,
+                          bool console);
+
 HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SIGNATURE_DESC* desc,
                                        std::uint64_t root_signature, const IID* riid, void** out) {
     note_slot(41);
@@ -2519,7 +2523,11 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
     if (desc && desc->pArgumentDescs)
         for (UINT i = 0; i < desc->NumArgumentDescs && !console; ++i)
             console = argument_type(desc->pArgumentDescs[i]) == kXboxIndirectArgumentDispatch105;
-    if (!console) return forward(self->real, desc, root_signature, riid, out);
+    if (!console) {
+        const HRESULT hr = forward(self->real, desc, root_signature, riid, out);
+        if (FAILED(hr)) log_failed_signature(desc, root_signature, hr, false);
+        return hr;
+    }
 
     std::unique_ptr<D3D12_INDIRECT_ARGUMENT_DESC[]> args(new (std::nothrow)
                                                              D3D12_INDIRECT_ARGUMENT_DESC[desc->NumArgumentDescs]);
@@ -2539,22 +2547,24 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
     D3D12_COMMAND_SIGNATURE_DESC pc = *desc;
     pc.pArgumentDescs = args.get();
     const HRESULT hr = forward(self->real, &pc, root_signature, riid, out);
-    // Test-branch diagnostic: a failing console signature, once per distinct (count, stride, result).
-    if (FAILED(hr)) {
-        static std::mutex mutex;
-        static std::set<std::tuple<UINT, UINT, HRESULT>> seen;
-        const std::lock_guard lock(mutex);
-        if (seen.insert({desc->NumArgumentDescs, desc->ByteStride, hr}).second) {
-            std::fprintf(stderr, "[rt] d3d12_xs: slot 41 CreateCommandSignature failed 0x%08lx: %u argument(s), stride %u, "
-                                 "root signature %s, types:",
-                         static_cast<unsigned long>(hr), desc->NumArgumentDescs, desc->ByteStride,
-                         root_signature ? "set" : "null");
-            for (UINT i = 0; i < desc->NumArgumentDescs; ++i)
-                std::fprintf(stderr, " %u", argument_type(desc->pArgumentDescs[i]));
-            std::fprintf(stderr, "\n");
-        }
-    }
+    if (FAILED(hr)) log_failed_signature(desc, root_signature, hr, true);
     return hr;
+}
+
+void log_failed_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, std::uint64_t root_signature, HRESULT hr,
+                          bool console) {
+    static std::mutex mutex;
+    static std::set<std::tuple<UINT, UINT, HRESULT>> seen;
+    const std::lock_guard lock(mutex);
+    const UINT count = desc ? desc->NumArgumentDescs : 0, stride = desc ? desc->ByteStride : 0;
+    if (!seen.insert({count, stride, hr}).second) return;
+    std::fprintf(stderr, "[rt] d3d12_xs: slot 41 CreateCommandSignature failed 0x%08lx (%s): %u argument(s), stride %u, "
+                         "root signature %s, types:",
+                 static_cast<unsigned long>(hr), console ? "type 105 converted" : "PC types", count, stride,
+                 root_signature ? "set" : "null");
+    for (UINT n = 0; desc && desc->pArgumentDescs && n < count; ++n)
+        std::fprintf(stderr, " %u", argument_type(desc->pArgumentDescs[n]));
+    std::fprintf(stderr, "\n");
 }
 
 // The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out), named
