@@ -100,6 +100,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+
+namespace leonida {
+class FrameTokenSource;
+}
 
 namespace rt::d3d12_xs {
 
@@ -181,6 +186,7 @@ ID3D12Device* device_proxy_real_device(const void* device);
 using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc,
                                       std::uint32_t layout, REFIID riid, void** out);
 void set_placed_at_va_handler(PlacedAtVaHandler handler);
+std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* device);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14 (descriptor heap proxy), 17-24 (CPU descriptor handle translation), 26 (the console's struct-return form), 31/34/35/45/46/50 (proxies unwrapped),
