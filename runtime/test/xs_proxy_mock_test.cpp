@@ -1614,12 +1614,13 @@ int check_xbox_queue_slots() {
     EXPECT(xs::queue_slot_overridden(35) && xs::queue_slot_overridden(14) && xs::queue_slot_overridden(15));
     EXPECT(!xs::queue_slot_overridden(10) && !xs::queue_slot_overridden(34) && !xs::queue_slot_overridden(36));
 
-    void* fake_lists[2] = {reinterpret_cast<void*>(0x12340000), reinterpret_cast<void*>(0x56780000)};
-    EXPECT(raw(queue, 35, (0xdeadbeefull << 32) | 2ull, word(fake_lists)) == 0);
+    // Null entries: slot 35 unwraps each list proxy as slot 10 does, so the real queue gets a copy of the array.
+    void* lists[2] = {nullptr, nullptr};
+    EXPECT(raw(queue, 35, (0xdeadbeefull << 32) | 2ull, word(lists)) == 0);
     EXPECT(xs::queue_slot_hits(35) == 1 && xs::queue_slot_first_call_seen(35));
     EXPECT(xs::queue_slot_hits(10) == 0);
     EXPECT(queue_mock->calls[35] == 0 && queue_mock->calls[10] == 1);
-    EXPECT(queue_mock->args[10][0] == 2 && queue_mock->args[10][1] == word(fake_lists));
+    EXPECT(queue_mock->args[10][0] == 2 && queue_mock->args[10][1] != 0);
 
     EXPECT(raw(queue, 35, 0, 0) == 0);
     EXPECT(xs::queue_slot_hits(35) == 2 && queue_mock->calls[35] == 0 && queue_mock->calls[10] == 2);

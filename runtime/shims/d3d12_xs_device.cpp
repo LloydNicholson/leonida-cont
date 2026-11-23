@@ -1245,10 +1245,15 @@ std::uint64_t queue_present_x(ChildProxy*, std::uint64_t, std::uint64_t, std::ui
 
 std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word) {
     // Pass zero-extended UINT in 64-bit RDX so both 32-bit PC implementations and 64-bit mock thunks see clean count.
+    // The lists are the title's list proxies: each is replaced by its real list, as slot 10 does (test-branch fix to the
+    // #7286 cherry-pick, which passed the proxies through).
+    const auto count = static_cast<std::uint64_t>(static_cast<UINT>(count_word));
+    UnwrappedArray unwrapped;
+    if (!unwrapped.fill(lists_word, count)) return 0;
+    if (unwrapped.data()) lists_word = unwrapped.data();
     using ExecuteFn = void(WINAPI*)(void*, std::uint64_t, ID3D12CommandList* const*);
     reinterpret_cast<ExecuteFn>(self->real_vtable[kQueueExecuteCommandLists])(
-        self->real, static_cast<std::uint64_t>(static_cast<UINT>(count_word)),
-        reinterpret_cast<ID3D12CommandList* const*>(lists_word));
+        self->real, count, reinterpret_cast<ID3D12CommandList* const*>(lists_word));
     return 0;
 }
 
@@ -1402,9 +1407,6 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             return hr_to_u64(E_NOTIMPL);
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
-        if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandLists) {
-            return queue_execute_command_lists(self, a1, a2);
-        }
         if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
 
         // Queue slot 10: ExecuteCommandLists(count, lists). The array is copied with each list proxy replaced by
