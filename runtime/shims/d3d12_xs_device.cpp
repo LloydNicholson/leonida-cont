@@ -1962,32 +1962,28 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
                      "[rt] d3d12_xs: slot 73 CreateCommandListX desc words 0x%08x 0x%08x -> node mask 0, type %d\n",
                      words[0], words[1], static_cast<int>(type));
 
-    // The list comes from the slot 12 path (the allocator proxy unwrapped there), as the console list proxy over a PC
-    // graphics list. Measured locally at a title's call sites: riid is a console command-list IID that no PC object
-    // answers, so asking the PC device for it fails every list. The proxy is the console-shaped list that IID asks
-    // for: an IID the proxy answers is returned as asked, and any other is answered with the proxy itself.
-    void* list = nullptr;
-    const HRESULT hr = proxy_create_command_list(self, 0, static_cast<std::uint64_t>(type), allocator_word,
-                                                 initial_state_word, &__uuidof(ID3D12GraphicsCommandList), &list);
+    // Leonida wraps its Vulkan allocators; a PC allocator comes back unwrapped and is passed as it is. Pipeline states
+    // are not wrapped by this proxy, so initial_state is already the real object (a proxy there is passed through too).
+    auto* allocator = allocator_proxy_real_allocator(reinterpret_cast<void*>(allocator_word));
+    if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
+    auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
+    if (!self->console_lists)
+        return self->real->CreateCommandList(0, type, allocator, initial_state, *riid, out);
+    void* created = nullptr;
+    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
+                                                   __uuidof(ID3D12GraphicsCommandList), &created);
     if (FAILED(hr)) return hr;
-    if (!list) return E_FAIL;
-    auto* unknown = static_cast<IUnknown*>(list);
-    if (IsEqualIID(*riid, __uuidof(ID3D12GraphicsCommandList))) {
-        *out = list;
-        return S_OK;
-    }
-    void* asked = nullptr;
-    if (SUCCEEDED(unknown->QueryInterface(*riid, &asked)) && asked) {
-        unknown->Release();
-        *out = asked;
-        return S_OK;
-    }
+    if (!created) return E_FAIL;
+    // Measured at the retail executable's call sites (#7076): riid is a console command-list IID that no PC object
+    // answers, so the proxy refuses it. The proxy is the console-shaped list that IID asks for, so a refused riid is
+    // answered with the proxy itself; an IID the proxy answers is returned as asked.
+    if (is_list_iid(*riid) || supports_iid(static_cast<IUnknown*>(created), *riid))
+        return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
     static std::atomic<bool> console_iid_logged{false};
     if (first_call(console_iid_logged))
         std::fprintf(stderr, "[rt] d3d12_xs: slot 73 asks for a list IID the PC does not know; answered with the "
                              "console list proxy\n");
-    *out = list;
-    return S_OK;
+    return wrap_list(static_cast<IUnknown*>(created), self, &__uuidof(ID3D12GraphicsCommandList), out);
 }
 
 // Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.

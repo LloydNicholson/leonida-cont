@@ -147,6 +147,9 @@ bool mock_has(const Mock* m, REFIID iid) {
         case Kind::fence:
             return IsEqualIID(iid, __uuidof(ID3D12Fence)) || (m->fence1 && IsEqualIID(iid, __uuidof(ID3D12Fence1)));
         case Kind::resource: return IsEqualIID(iid, __uuidof(ID3D12Resource));
+        case Kind::command_list:
+            return IsEqualIID(iid, __uuidof(ID3D12CommandList)) ||
+                   IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList));
         case Kind::allocator:
             return IsEqualIID(iid, __uuidof(ID3D12CommandAllocator)) ||
                    (m->allocator_tag && IsEqualIID(iid, xs::kLeonidaCommandAllocatorTag));
@@ -820,12 +823,12 @@ int check_xbox_slots() {
     EXPECT(xs::is_list_proxy(console_list) && mock->calls[12] == 2 && mock->calls[73] == 0);
     EXPECT(IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), list_iid));
     EXPECT(release(console_list) == 0);
-    // A PC list IID the proxy answers is returned as asked.
+    // A PC list IID is not answered with the proxy: it is returned only when the real list implements it. This
+    // device's mock list implements ID3D12GraphicsCommandList alone, so ID3D12GraphicsCommandList1 is refused.
     const IID list1_iid = __uuidof(ID3D12GraphicsCommandList1);
     void* list1 = nullptr;
-    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list1_iid), word(&list1))) == S_OK);
-    EXPECT(xs::is_list_proxy(list1) && mock->calls[12] == 3);
-    EXPECT(release(list1) == 0);
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list1_iid), word(&list1))) == E_NOINTERFACE);
+    EXPECT(list1 == nullptr && mock->calls[12] == 3);
 
     // Missing description, allocator or output: E_INVALIDARG/E_POINTER before the real device is called.
     EXPECT(hr_of(raw(device, 73, 0, word(allocator), 0, word(&list_iid), word(&list))) == E_INVALIDARG);
