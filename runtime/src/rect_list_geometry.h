@@ -18,6 +18,10 @@
 // rectangle. Every Location output of the vertex stage is a vec4 float in the translator's output (rdna2spirv.py),
 // and so is the stage's Position; the generated stage reads and writes exactly those.
 //
+// The edges are measured in normalized device coordinates, not pixels (the stage does not know the viewport). For the
+// usual axis-aligned rectangle that is exact; a rotated rectangle drawn into a very non-square viewport can pick a
+// different corner than the pixel-space right angle.
+//
 // Not covered, and refused with a reason: a vertex stage that writes ClipDistance, CullDistance, Layer or
 // ViewportIndex, or a Location output that is not a vec4 float.
 //

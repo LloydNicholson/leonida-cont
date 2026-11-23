@@ -364,11 +364,31 @@ int main() {
             return 1;
         }
     }
-    // Not a right triangle: any consistent corner, but it must draw (some pixel differs from the clear colour).
+    // Not a right triangle: any consistent corner is fine, but every corner choice makes a parallelogram that holds the
+    // drawn triangle, so each pixel well inside the triangle must be drawn (not the clear colour).
     const Pixel clear_pixel = {0.5f, 0.125f, 0.25f, 0.5f};
-    unsigned skew_drawn = 0;
-    for (const Pixel& p : skew_pixels) skew_drawn += std::memcmp(&p, &clear_pixel, sizeof(Pixel)) != 0;
-    EXPECT(skew_drawn > 0);
+    unsigned skew_drawn = 0, skew_inside = 0, skew_missing = 0;
+    {
+        const Vertex* t = &vertices[17];
+        const float x0 = t[0].position[0], y0 = t[0].position[1];
+        const float ax = t[1].position[0] - x0, ay = t[1].position[1] - y0;
+        const float bx = t[2].position[0] - x0, by = t[2].position[1] - y0;
+        const float det = ax * by - ay * bx;
+        for (UINT row = 0; row < target_extent; ++row) {
+            for (UINT col = 0; col < target_extent; ++col) {
+                const float px = 2.0f * (float(col) + 0.5f) / target_extent - 1.0f - x0;
+                const float py = 1.0f - 2.0f * (float(row) + 0.5f) / target_extent - y0;
+                const float s = (px * by - py * bx) / det, r = (ax * py - ay * px) / det;
+                const bool drawn = std::memcmp(&skew_pixels[row * target_extent + col], &clear_pixel, sizeof(Pixel)) != 0;
+                skew_drawn += drawn;
+                if (s > 0.02f && r > 0.02f && s + r < 0.98f) {
+                    ++skew_inside;
+                    skew_missing += !drawn;
+                }
+            }
+        }
+    }
+    EXPECT(skew_inside > 1000 && skew_missing == 0);
 
     // Quad list: whole-bit comparison; two quadrants one colour each, the rest the clear colour.
     const Pixel clear_color = {0.5f, 0.125f, 0.25f, 0.5f};
