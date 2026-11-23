@@ -71,7 +71,8 @@
 //
 // Command queues and fences (device slots 8, 75, 36, and 32 for a shared fence) come back wrapped in queue and fence
 // proxies of the same kind: the public chain (19 queue slots, 11 or 12 fence slots in SDK 10.0.26100) is forwarded
-// in PC order, and a slot past it, up to the end of the proxy's table (128 queue, 64 fence slots), is logged with its
+// in PC order. Queue slot 35 is the console ExecuteCommandLists(count, lists) variant and forwards to PC slot 10;
+// any other slot past it, up to the end of the proxy's table (128 queue, 64 fence slots), is logged with its
 // first four argument words and answered S_OK on a queue or refused with E_NOTIMPL on a fence or allocator. A slot
 // past the table faults on the vtable read inside a
 // reserved, never-committed region, and the fault is logged with the slot. That is where the console's queue methods
@@ -196,6 +197,9 @@ unsigned queue_proxy_slot_count(const void* queue);
 unsigned fence_proxy_slot_count(const void* fence);
 unsigned queue_proxy_table_size();
 unsigned fence_proxy_table_size();
+// True for queue slots handled by the proxy instead of forwarded verbatim past IUnknown: 0-2 (IUnknown),
+// 7 (GetDevice), 14/15 (Signal/Wait unwrap fences), and 35 (Xbox ExecuteCommandLists variant -> PC slot 10).
+bool queue_slot_overridden(unsigned slot);
 // Live references on a queue, fence or allocator proxy (0 for anything else). Test helper.
 unsigned long command_object_proxy_ref_count(const void* object);
 // Per-slot call counters and first-call flags, shared by all queue proxies and all fence proxies.
