@@ -4101,9 +4101,16 @@ private:
         info.pDynamicState = &dynamic;
         info.layout = graphics_.layout;
         VkPipeline pipeline = VK_NULL_HANDLE;
-        if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
-                                                          &info, nullptr, &pipeline) != VK_SUCCESS)
-            return VK_NULL_HANDLE;
+        VkResult created = VK_ERROR_UNKNOWN;
+        {
+            // Test branch: a graphics compile is host-only time on the title's thread too (the retail title creates
+            // tens of thousands of these through device slot 86), so a guest Sleep sits it out as #7858 does for
+            // compute pipelines and the title's startup hang check keeps restarting its count.
+            const rt::host_stall::Scope compiling;
+            created = device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
+                                                                    &info, nullptr, &pipeline);
+        }
+        if (created != VK_SUCCESS) return VK_NULL_HANDLE;
         return pipeline;
     }
 
