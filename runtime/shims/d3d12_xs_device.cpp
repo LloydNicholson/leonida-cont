@@ -106,8 +106,10 @@ struct DeviceProxy {
     std::atomic<std::uint32_t> frame_interval_us{0};
     std::atomic<std::uint32_t> frame_latency{1};
     std::atomic<bool> frame_event_scheduled{false};
-    std::atomic<std::uint32_t> frame_event_id{0};         // test branch: ScheduleFrameEventX's event, replayed below
-    std::atomic<std::uint32_t> frame_event_offset_us{0};  // test branch: and its offset
+    // Test branch: each ScheduleFrameEventX event (0 the origin, 2 the retail title's second one) and its offset, so
+    // all of them can be replayed into the PresentX pacer. Events past 3 are not kept.
+    std::atomic<std::uint32_t> frame_events_scheduled{0};  // bit n: event n scheduled
+    std::atomic<std::uint32_t> frame_event_offset_us[4]{};
     std::shared_ptr<leonida::FrameTokenSource> frame_tokens = std::make_shared<leonida::FrameTokenSource>();
 };
 
@@ -1367,14 +1369,16 @@ PresentState* present_state_for(DeviceProxy* device) {
     if (interval_us) {
         const HRESULT interval_hr =
             state->xbox->SetFrameIntervalX(nullptr, interval_us, device->frame_latency.load(std::memory_order_relaxed), 0);
-        HRESULT schedule_hr = S_FALSE;
-        if (device->frame_event_scheduled.load(std::memory_order_relaxed))
-            schedule_hr = state->xbox->ScheduleFrameEventX(device->frame_event_id.load(std::memory_order_relaxed),
-                                                           device->frame_event_offset_us.load(std::memory_order_relaxed), 0);
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: PresentX pacer takes the device's frame interval %u us (0x%08lx) and origin event "
-                     "(0x%08lx)\n",
-                     interval_us, static_cast<unsigned long>(interval_hr), static_cast<unsigned long>(schedule_hr));
+        const std::uint32_t scheduled = device->frame_events_scheduled.load(std::memory_order_relaxed);
+        std::fprintf(stderr, "[rt] d3d12_xs: PresentX pacer takes the device's frame interval %u us (0x%08lx)\n",
+                     interval_us, static_cast<unsigned long>(interval_hr));
+        for (UINT event = 0; event < 4; ++event) {  // the origin (0) first: the others are relative to it
+            if (!(scheduled & (1u << event))) continue;
+            const HRESULT hr = state->xbox->ScheduleFrameEventX(
+                event, device->frame_event_offset_us[event].load(std::memory_order_relaxed), 0);
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX pacer schedules frame event %u (0x%08lx)\n", event,
+                         static_cast<unsigned long>(hr));
+        }
     }
     return state;
 }
@@ -2368,8 +2372,10 @@ HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std:
 HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t offset_us,
                                      std::uint64_t flags) {
     (void)flags;
-    self->frame_event_id.store(static_cast<std::uint32_t>(event), std::memory_order_relaxed);
-    self->frame_event_offset_us.store(static_cast<std::uint32_t>(offset_us), std::memory_order_relaxed);
+    if (event < 4) {
+        self->frame_event_offset_us[event].store(static_cast<std::uint32_t>(offset_us), std::memory_order_relaxed);
+        self->frame_events_scheduled.fetch_or(1u << event, std::memory_order_relaxed);
+    }
     self->frame_event_scheduled.store(true, std::memory_order_relaxed);
     if (auto* xbox = device_presentation(self))  // test branch: the pacer behind PresentX follows it
         xbox->ScheduleFrameEventX(static_cast<UINT>(event), static_cast<UINT>(offset_us), 0);
