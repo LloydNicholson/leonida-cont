@@ -273,6 +273,7 @@ const char* slot_name(unsigned slot) {
         case 48: return "Xbox CreateCommandQueueX (32-byte desc) -> queue proxy";
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
         case 56: return "GetResourceAllocationInfo1 (C or PC form)";
+        case 57: return "Xbox DeserializeGraphicsPipelineStateX";
         case 61: return "Xbox CreateSamplerX -> PC CreateSampler";
         case 62: return "Xbox CreateComputePipelineState";
         case 67: return "Xbox DeserializeComputePipelineStateX";
@@ -4302,7 +4303,7 @@ std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* devic
 
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 || slot == 31 || slot == 32 ||
-        slot == 34 || slot == 35 || slot == 36 || slot == 41 || slot == 45 || slot == 46 || slot == 50 || slot == 56 || slot == 61 || slot == 62 ||
+        slot == 34 || slot == 35 || slot == 36 || slot == 41 || slot == 45 || slot == 46 || slot == 50 || slot == 56 || slot == 57 || slot == 61 || slot == 62 ||
         slot == 67 || slot == 70 || slot == 74 || slot == 75 || slot == 76 || slot == 86 || slot == 101 || slot == 108 || slot == 133 ||
         slot == kCreateCommittedResource3X)
         return true;
