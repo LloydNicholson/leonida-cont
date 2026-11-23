@@ -12167,10 +12167,12 @@ class Gen:
         if is3d and op in ("image_sample_d", "image_sample_d_cl") and ("tfe" in mods or "lwe" in mods):
             raise Unsupported(op + " 3D gradient status")
         grad_width = 3 if is3d else min(ncoord, 2)  # an array layer has no derivative
+        # Cube loads use the same 2D-array view (sampled or storage) and integer layer as array loads.
+        view_dim = "dim:SQ_RSRC_IMG_2D_ARRAY" if dim == "dim:SQ_RSRC_IMG_CUBE" else dim
         # glc makes the access coherent (see image_load_coherent). Only image_load can be: a sampled read has no
         # coherent form in SPIR-V, so it is refused rather than read stale.
         coherent = "glc" in mods
-        if coherent and (op != "image_load" or dim not in self.STORE_DIMS):
+        if coherent and (op != "image_load" or view_dim not in self.STORE_DIMS):
             raise Unsupported(op + " glc " + dim.split("SQ_RSRC_IMG_")[-1])
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
         dmask = int(dm.split(":")[1], 0)
@@ -12229,10 +12231,8 @@ class Gen:
                 iv = self.tmp()
                 self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if ncoord == 2 else '%v3int'} {' '.join(ints)}")
             if coherent:
-                self.image_load_coherent(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img_idx, dmask, vdata, d16)
+                self.image_load_coherent(view_dim, self.sgpr_word(a[2], 1), iv, img_idx, dmask, vdata, d16)
                 return
-            # Cube loads use the same sampled 2D-array view and integer layer as array loads.
-            view_dim = "dim:SQ_RSRC_IMG_2D_ARRAY" if dim == "dim:SQ_RSRC_IMG_CUBE" else dim
             self.image_load_typed(view_dim, self.sgpr_word(a[2], 1), iv, img, img_idx,
                                   dmask, vdata, self.cu(0), d16)
             return
@@ -12577,12 +12577,12 @@ class Gen:
             for i, comp in enumerate(comps):
                 self.dst({"k": "vgpr", "r": vdata["r"] + i, "n": 1}, self.tou(comp))
 
-    # image atomic -> (SPIR-V op, value that leaves memory unchanged, used for inactive lanes)
-    IMG_ATOMICS = {"image_atomic_umin": ("OpAtomicUMin", 0xFFFFFFFF), "image_atomic_umax": ("OpAtomicUMax", 0),
-                   "image_atomic_smin": ("OpAtomicSMin", 0x7FFFFFFF), "image_atomic_smax": ("OpAtomicSMax", 0x80000000),
-                   "image_atomic_or": ("OpAtomicOr", 0), "image_atomic_xor": ("OpAtomicXor", 0),
-                   "image_atomic_and": ("OpAtomicAnd", 0xFFFFFFFF), "image_atomic_add": ("OpAtomicIAdd", 0),
-                   "image_atomic_sub": ("OpAtomicISub", 0)}
+    # image atomic -> SPIR-V op (guarded inside `if (active)` so inactive lanes skip the access)
+    IMG_ATOMICS = {"image_atomic_umin": "OpAtomicUMin", "image_atomic_umax": "OpAtomicUMax",
+                   "image_atomic_smin": "OpAtomicSMin", "image_atomic_smax": "OpAtomicSMax",
+                   "image_atomic_or": "OpAtomicOr", "image_atomic_xor": "OpAtomicXor",
+                   "image_atomic_and": "OpAtomicAnd", "image_atomic_add": "OpAtomicIAdd",
+                   "image_atomic_sub": "OpAtomicISub"}
     IMG_ATOMICS_EXTRA = ("image_atomic_swap", "image_atomic_inc", "image_atomic_dec",
                          "image_atomic_fmin", "image_atomic_fmax", "image_atomic_fcmpswap")
 
@@ -12812,10 +12812,12 @@ class Gen:
         (UNORM/SNORM/FLOAT convert from the float bits the shader wrote). Missing components are 0.
         With d16, enabled components are packed two 16-bit values per consecutive VGPR (low half first): IEEE f16
         widened to f32 for float/norm views, zero-extended u16 for UINT views, and sign-extended i16 for SINT views."""
-        if dim not in self.STORE_DIMS or any(m in mods for m in ("tfe", "lwe")):
+        # Cube storage images are bound as 6-layer 2D arrays (runtime/src/vulkan_bindless.h).
+        view_dim = "dim:SQ_RSRC_IMG_2D_ARRAY" if dim == "dim:SQ_RSRC_IMG_CUBE" else dim
+        if view_dim not in self.STORE_DIMS or any(m in mods for m in ("tfe", "lwe")):
             raise Unsupported("image_store " + dim.split("SQ_RSRC_IMG_")[-1] + (" a16" if "a16" in mods else "")
                               + (" d16" if "d16" in mods else ""))
-        di, _, _, nc = self.STORE_DIMS[dim]
+        di, _, _, nc = self.STORE_DIMS[view_dim]
         if "glc" in mods:
             self.coherent_images = True     # a coherent store (glc, device scope): see image_load_coherent
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0xf")
@@ -12948,7 +12950,7 @@ class Gen:
                 vals[i] = kept
         return vals + [lv]
 
-    def emit_image_atomic_extra(self, op, ip, iv, vdata, mods):
+    def emit_image_atomic_extra(self, op, ptr_ty, arr_var, idx, iv, vdata, mods):
         """Lower 32-bit image_atomic_{swap,inc,dec,fmin,fmax,fcmpswap} on an r32ui storage image (2D or 3D).
         Inactive lanes skip the op and preserve vdata. CAS loops use OpAtomicLoad (valid on Image pointers) +
         OpAtomicCompareExchange, requiring no shader float atomic extension."""
@@ -12962,7 +12964,8 @@ class Gen:
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
-        tp = self.tmp()
+        ip, tp = self.tmp(), self.tmp()
+        self.dynamic_storage_access(ip, ptr_ty, arr_var, idx)
         self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
         sc, sem = self.cu(1), self.cu(0)
         if op == "image_atomic_swap":
@@ -13106,92 +13109,52 @@ class Gen:
                 raise Unsupported(op + " coords")
             return [self.as_int(c) for c in raw[:nc]]
 
-        if is3d_atomic:
-            # 3D r32ui storage image atomics (binding 7).
-            self.uses_storage3d = True
-            coords = atomic_coords(3)
-            iv, ip = self.tmp(), self.tmp()
-            self.emit(f"{iv} = OpCompositeConstruct %v3int {coords[0]} {coords[1]} {coords[2]}")
-            self.dynamic_storage_access(ip, "%_ptr_UC_simg3", "%simages3d", idx)
-            if op in self.IMG_ATOMICS_EXTRA:
-                self.emit_image_atomic_extra(op, ip, iv, vdata, mods)
-                return
-            tp, old, safe = self.tmp(), self.tmp(), self.tmp()
-            val = self.load_reg("vgpr", vdata["r"])
-            if op == "image_atomic_cmpswap":
-                cmpv = self.load_reg("vgpr", vdata["r"] + 1)
-                act = self.active_b()
-                do, end = self.tmp() + "_do", self.tmp() + "_end"
-                self.emit(f"OpSelectionMerge {end} None")
-                self.emit(f"OpBranchConditional {act} {do} {end}")
-                self.emit(f"{do} = OpLabel")
-                self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
-                self.emit(f"{old} = OpAtomicCompareExchange %uint {tp} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmpv}")
-                if "glc" in mods:
-                    self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
-                self.emit(f"OpBranch {end}")
-                self.emit(f"{end} = OpLabel")
-                return
-            spv, neutral = self.IMG_ATOMICS[op]
-            self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
-            self.emit(f"{safe} = OpSelect %uint {self.active_b()} {val} {self.cu(neutral)}")
-            self.emit(f"{old} = {spv} %uint {tp} {self.cu(1)} {self.cu(0)} {safe}")
-            if "glc" in mods:
-                self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
-            return
-        if op == "image_store":
-            self.image_store(a, mods, dim)
-            return
         if is_atomic:
-            # Storage image (2D r32ui). Atomics: vdata holds the operand; with 'glc' the pre-op value comes back.
-            self.uses_storage = True
-            coords = atomic_coords(2)
-            iv = self.tmp()
-            self.emit(f"{iv} = OpCompositeConstruct %v2int {coords[0]} {coords[1]}")
-            ip = self.tmp()
-            self.dynamic_storage_access(ip, "%_ptr_UC_simg", "%simages", idx)
+            # 2D (binding 4) or 3D (binding 7) r32ui storage image atomics.
+            # Guard OpAccessChain / OpImageTexelPointer / OpAtomic* inside `if (active)` so inactive lanes never
+            # execute spurious RMWs or dereference uninitialized descriptors/coordinates.
+            if is3d_atomic:
+                self.uses_storage3d = True
+                coords = atomic_coords(3)
+                iv = self.tmp()
+                self.emit(f"{iv} = OpCompositeConstruct %v3int {coords[0]} {coords[1]} {coords[2]}")
+                ptr_ty, arr_var = "%_ptr_UC_simg3", "%simages3d"
+            else:
+                self.uses_storage = True
+                coords = atomic_coords(2)
+                iv = self.tmp()
+                self.emit(f"{iv} = OpCompositeConstruct %v2int {coords[0]} {coords[1]}")
+                ptr_ty, arr_var = "%_ptr_UC_simg", "%simages"
             if op in self.IMG_ATOMICS_EXTRA:
-                self.emit_image_atomic_extra(op, ip, iv, vdata, mods)
-                return
-            val = self.load_reg("vgpr", vdata["r"])
-            if op == "image_store":
-                # Writes dmask component 0 as r32ui; only active lanes store.
-                img, lbl_do, lbl_end = self.tmp(), self.tmp() + "_do", self.tmp() + "_end"
-                self.emit(f"{img} = OpLoad %simg2d_u {ip}")
-                v4 = self.tmp()
-                self.emit(f"{v4} = OpCompositeConstruct %v4uint {val} {self.cu(0)} {self.cu(0)} {self.cu(0)}")
-                act = self.active_b()      # must be computed before OpSelectionMerge (merge directly precedes branch)
-                self.emit(f"OpSelectionMerge {lbl_end} None")
-                self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
-                self.emit(f"{lbl_do} = OpLabel")
-                self.emit(f"OpImageWrite {img} {iv} {v4}")
-                self.emit(f"OpBranch {lbl_end}")
-                self.emit(f"{lbl_end} = OpLabel")
-                self.uses_v4uint = True
+                self.emit_image_atomic_extra(op, ptr_ty, arr_var, idx, iv, vdata, mods)
                 return
             if op == "image_atomic_cmpswap":
-                # vdata = (src, cmp): memory = (memory == cmp) ? src : memory; glc returns the old value.
-                cmpv = self.load_reg("vgpr", vdata["r"] + 1)
-                act = self.active_b()
-                do, end = self.tmp() + "_do", self.tmp() + "_end"
-                self.emit(f"OpSelectionMerge {end} None")
-                self.emit(f"OpBranchConditional {act} {do} {end}")
-                self.emit(f"{do} = OpLabel")               # inactive lanes don't touch memory
-                tp, old = self.tmp(), self.tmp()
-                self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
-                self.emit(f"{old} = OpAtomicCompareExchange %uint {tp} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmpv}")
-                if "glc" in mods:
-                    self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
-                self.emit(f"OpBranch {end}")
-                self.emit(f"{end} = OpLabel")
-                return
-            spv, neutral = self.IMG_ATOMICS[op]
-            tp, old, safe = self.tmp(), self.tmp(), self.tmp()
+                if vdata["k"] != "vgpr" or vdata.get("n", 1) != 2:
+                    raise Unsupported(op + " data")
+            elif vdata["k"] != "vgpr":
+                raise Unsupported(op + " data")
+            # Two-VGPR dmask:0x3 forms of the nine standard ops are 64-bit atomics; keep main's low-dword
+            # 32-bit behavior here so corpus translation count does not drop while Int64ImageEXT + fallback
+            # is handled separately.
+            val = self.load_reg("vgpr", vdata["r"])
+            cmpv = self.load_reg("vgpr", vdata["r"] + 1) if op == "image_atomic_cmpswap" else None
+            act = self.active_b()
+            do, end = self.tmp() + "_do", self.tmp() + "_end"
+            self.emit(f"OpSelectionMerge {end} None")
+            self.emit(f"OpBranchConditional {act} {do} {end}")
+            self.emit(f"{do} = OpLabel")               # inactive lanes don't touch memory
+            ip, tp, old = self.tmp(), self.tmp(), self.tmp()
+            self.dynamic_storage_access(ip, ptr_ty, arr_var, idx)
             self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
-            self.emit(f"{safe} = OpSelect %uint {self.active_b()} {val} {self.cu(neutral)}")
-            self.emit(f"{old} = {spv} %uint {tp} {self.cu(1)} {self.cu(0)} {safe}")
+            if op == "image_atomic_cmpswap":
+                self.emit(f"{old} = OpAtomicCompareExchange %uint {tp} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmpv}")
+            else:
+                spv = self.IMG_ATOMICS[op]
+                self.emit(f"{old} = {spv} %uint {tp} {self.cu(1)} {self.cu(0)} {val}")
             if "glc" in mods:
                 self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
+            self.emit(f"OpBranch {end}")
+            self.emit(f"{end} = OpLabel")
             return
         ip, img = self.tmp(), self.tmp()
         if array_query:
@@ -17565,12 +17528,13 @@ def _run_spirv_tool(cmd, **kwargs):
         raise
 
 
-def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
+def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as", validate=True):
     """Keep the assembled module out of the final path until validation succeeds.
 
     `assembler="spirv-as"` invokes the external spirv-as binary on `sa` (default);
     `assembler="python"` encodes `asm_text` (or reads `sa`) directly in memory with
     tools/spirv_asm.py, avoiding the spirv-as subprocess and temporary .spvasm I/O.
+    When `validate=False`, skip running `spirv-val` after assembly.
     """
     with tempfile.NamedTemporaryFile(prefix=".spirv-", suffix=".tmp", dir=os.path.dirname(sv), delete=False) as f:
         tmp = Path(f.name)
@@ -17601,7 +17565,7 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
                     result.stdout = result.stdout.decode("utf-8", "replace")
                 if isinstance(result.stderr, bytes):
                     result.stderr = result.stderr.decode("utf-8", "replace")
-        if result.returncode == 0:
+        if result.returncode == 0 and validate:
             # Offset on non-gather: VK_KHR_maintenance8
             result = _run_spirv_tool(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
                                      tmp.name], capture_output=True, text=True, cwd=folder)
@@ -17675,6 +17639,9 @@ def main():
     ap.add_argument("--assembler", choices=("spirv-as", "python"), default="spirv-as",
                     help="SPIR-V binary assembler: spirv-as (default, external binary) or python (in-process "
                          "tools/spirv_asm.py; skips writing .spvasm to disk when combined with --no-asm)")
+    ap.add_argument("--no-validate", action="store_true",
+                    help="skip spirv-val after assembly (for running GPU tests without SPIRV-Tools when paired "
+                         "with --assembler python)")
     ap.add_argument("--merge", action="store_true", help="merge index.part*.json in --out into index.json and exit")
     ap.add_argument("--fssm-dir", default=None,
                     help="optional dir with <name>.fssm sidecars: records fssm_sha256 per shader in the index")
@@ -17865,7 +17832,7 @@ def main():
             with open(sa, "w", encoding="utf-8", newline="\n") as f:
                 f.write(asm)
         try:
-            r = assemble_spirv(sa, sv, asm_text=asm, assembler=a.assembler)
+            r = assemble_spirv(sa, sv, asm_text=asm, assembler=a.assembler, validate=not a.no_validate)
         except OSError as e:
             # A missing spirv-as/spirv-val fails every shader the same way; report it once as a setup
             # error (exit 2) instead of a FileNotFoundError traceback from the first one.
@@ -17918,7 +17885,8 @@ def main():
     if shard is None:
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, old)
-    print(f"{len(files)} shaders: {ok} translated, {valid} pass spirv-val")
+    status_label = "assembled (spirv-val skipped)" if a.no_validate else "pass spirv-val"
+    print(f"{len(files)} shaders: {ok} translated, {valid} {status_label}")
     if W64G_COUNTS:
         print("wave64 VS/PS/GS on 32-wide subgroups: " + ", ".join(f"tier {t}: {n}" for t, n in sorted(W64G_COUNTS.items()))
               + (" (tier C is not exact there; see wave64_graphics_reasons in the index)" if W64G_COUNTS["C"] else ""))
