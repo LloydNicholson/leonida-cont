@@ -29,6 +29,7 @@
 #include "d3d12_xs_desc_clean.h"
 #include "../src/d3d12_xs_frame_events.h"
 #include "../src/frame_pacer.h"
+#include "d3d12_xs_pso_stream.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -287,6 +288,7 @@ const char* slot_name(unsigned slot) {
         case 79: return "Xbox ScheduleFrameEventX";
         case 80: return "Xbox WaitFrameEventX";
         case 133: return "Xbox CreatePlacedResourceX (a buffer on the title's pages)";
+        case 55: return "Xbox CreateDerivedPipelineState -> PC CreatePipelineState of the patched stream (slot 47)";
         case 86: return "Xbox CreatePipelineState -> PC CreatePipelineState (slot 47)";
         case 101: return "Xbox CreateStateObject -> PC CreateStateObject (slot 62)";
         case 108: return "Xbox GetResourceAllocationInfo2 -> PC GetResourceAllocationInfo2 (slot 68)";
@@ -3189,8 +3191,10 @@ bool parse_xbox_pipeline_blob_input_layout_impl(const void* blob, std::size_t bl
         !read_u32(0x3c, tag_3c) || !read_u32(0x4c, num_elements))
         return false;
     if (num_elements == 0 || num_elements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT) return true;
-    // Measured at +0x10: 0x1c (28 bytes = 7 u32) in PSOs 1 and 2, 0 in PSO 3 where the element stride is still 28 B.
-    const std::size_t stride_after_name = (field_block_size >= 16 && field_block_size <= 64) ? field_block_size : 28u;
+    // Every element is its name and 28 bytes: +0x38 = 4 + n * 28 + sum(len(name) + 1) (docs/fspx.md). HYPOTHESIS that
+    // this holds for every blob: with +0x10 as the stride the retail boot read ASCII names as formats (5394252 "LOR").
+    constexpr std::size_t stride_after_name = 28;
+    (void)field_block_size;
     std::size_t pos = 0x54;
     for (std::uint32_t idx = 0; idx < num_elements && pos + 4 <= blob_size; ++idx) {
         const void* nul = std::memchr(bytes + pos, 0, blob_size - pos);
@@ -3711,20 +3715,80 @@ std::uint64_t proxy_slot74(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3)
     return hr_to_u64(S_OK);
 }
 
+// Keeps a copy of the stream a PSO was created from, on the PSO, so slot 55 can derive from it. A stream the module
+// does not model is logged once: the PSO is still returned, and slot 55 refuses it as a base.
+void keep_pso_stream(IUnknown* pso, const D3D12_PIPELINE_STATE_STREAM_DESC& desc) {
+    ID3D12Object* object = nullptr;
+    if (FAILED(pso->QueryInterface(__uuidof(ID3D12Object), reinterpret_cast<void**>(&object))) || !object) return;
+    auto record = PsoStreamRecord::capture(desc);
+    static std::atomic<bool> logged{false};
+    if (!record || !attach_pso_record(object, std::move(record))) {
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: a pipeline state stream is not kept for derivation (unmodelled subobject or allocation failure); slot 55 refuses that PSO as a base\n");
+    }
+    object->Release();
+}
+
+// The PC CreatePipelineState (PC slot 47) that slots 86 and 55 share: on success the stream is kept on the PSO.
+HRESULT create_pso_from_stream(DeviceProxy* self, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, const IID* riid,
+                               void** out) {
+    if (!riid) return E_POINTER;
+    // Through the queried interface (#8517): its pointer and vtable need not be the original device's.
+    ID3D12Device2* device2 = nullptr;
+    const HRESULT query = self->real->QueryInterface(__uuidof(ID3D12Device2), reinterpret_cast<void**>(&device2));
+    if (FAILED(query) || !device2) return FAILED(query) ? query : E_NOINTERFACE;
+    const HRESULT hr = device2->CreatePipelineState(desc, *riid, out);
+    device2->Release();
+    if (SUCCEEDED(hr) && out && *out && desc) keep_pso_stream(static_cast<IUnknown*>(*out), *desc);
+    return hr;
+}
+
 // Xbox slot 86: CreatePipelineState(desc, riid, out), forwarded to PC ID3D12Device2::CreatePipelineState (PC slot 47).
 HRESULT proxy_create_pipeline_state(DeviceProxy* self, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, const IID* riid,
                                     void** out) {
     note_slot(86);
     if (out) *out = nullptr;
     if (self->slot_count <= 47) return refuse_beyond_device(86, self->slot_count);  // predates ID3D12Device2
-    if (!riid) return E_POINTER;
-    // Supporting an interface does not make its pointer or vtable identical to the original device's.
-    ID3D12Device2* device2 = nullptr;
-    const HRESULT query = self->real->QueryInterface(__uuidof(ID3D12Device2), reinterpret_cast<void**>(&device2));
-    if (FAILED(query) || !device2) return FAILED(query) ? query : E_NOINTERFACE;
-    const HRESULT result = device2->CreatePipelineState(desc, *riid, out);
-    device2->Release();
-    return result;
+    return create_pso_from_stream(self, desc, riid, out);
+}
+
+// Logs a slot 55 refusal once per reason, and returns the HRESULT.
+HRESULT refuse_derived(unsigned reason, const char* why, HRESULT hr) {
+    static std::atomic<bool> logged[4]{};
+    if (!logged[reason].exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: derived pipeline state (device slot 55) refused: %s\n", why);
+    return hr;
+}
+
+// Xbox slot 55: CreateDerivedPipelineState(pBasePSO, n, pRecords, riid, ppv). The base must be a PSO that slot 86 or
+// slot 55 created with a kept stream; n is 1..4 records of 0x14c bytes (d3d12_xs_pso_stream.h). The patched stream
+// goes through the slot 86 path. Every refusal leaves *ppv null and returns a failure, never a fake success.
+HRESULT proxy_create_derived_pso(DeviceProxy* self, ID3D12PipelineState* base, std::uint32_t count,
+                                 const unsigned char* records, const IID* riid, void** out) {
+    note_slot(55);
+    if (out) *out = nullptr;
+    if (self->slot_count <= 47) return refuse_beyond_device(55, self->slot_count);  // predates ID3D12Device2
+    if (!out || !riid || !records) return E_POINTER;
+    const PsoStreamRecord* base_record = base ? find_pso_record(base) : nullptr;
+    if (!base_record) return refuse_derived(0, "base PSO has no kept stream", E_FAIL);
+    std::vector<unsigned char> patched;
+    switch (derive_stream(*base_record, records, count, patched)) {
+        case DeriveStatus::ok: break;
+        case DeriveStatus::unknown_tag: return refuse_derived(1, "record tag not known", E_INVALIDARG);
+        case DeriveStatus::missing_state: return refuse_derived(2, "base has no subobject for a record", E_INVALIDARG);
+        case DeriveStatus::malformed: return refuse_derived(3, "record count or base stream malformed", E_INVALIDARG);
+    }
+    D3D12_PIPELINE_STATE_STREAM_DESC desc{};
+    desc.SizeInBytes = patched.size();
+    desc.pPipelineStateSubobjectStream = patched.data();
+    const HRESULT hr = create_pso_from_stream(self, &desc, riid, out);
+    // Test-branch diagnostic: derived pipelines made, at powers of ten, and the first failures.
+    static std::atomic<unsigned> made{0}, failed{0};
+    const unsigned n = (SUCCEEDED(hr) ? made : failed).fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || n == 10 || n == 100 || n == 1000)
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 55 derived pipelines %s: %u (0x%08lx, %u record(s))\n",
+                     SUCCEEDED(hr) ? "created" : "failed", n, static_cast<unsigned long>(hr), count);
+    return hr;
 }
 
 // Xbox slot 101: CreateStateObject(desc, riid, out), forwarded to PC ID3D12Device5::CreateStateObject (PC slot 62,
@@ -3949,6 +4013,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             reinterpret_cast<void**>(a7)));
     } else if constexpr (Slot == kCreateCommittedResource3X) {
         return hr_to_u64(proxy_create_committed_resource3_x(self, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10));
+    } else if constexpr (Slot == 55) {
+        return hr_to_u64(proxy_create_derived_pso(
+            self, reinterpret_cast<ID3D12PipelineState*>(a1), static_cast<std::uint32_t>(a2),
+            reinterpret_cast<const unsigned char*>(a3), reinterpret_cast<const IID*>(a4),
+            reinterpret_cast<void**>(a5)));
     } else if constexpr (Slot == 86) {
         return hr_to_u64(proxy_create_pipeline_state(
             self, reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_DESC*>(a1),
@@ -4323,7 +4392,7 @@ std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* devic
 
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 || slot == 31 || slot == 32 ||
-        slot == 34 || slot == 35 || slot == 36 || slot == 41 || slot == 45 || slot == 46 || slot == 50 || slot == 56 || slot == 57 || slot == 61 || slot == 62 ||
+        slot == 34 || slot == 35 || slot == 36 || slot == 41 || slot == 45 || slot == 46 || slot == 50 || slot == 55 || slot == 56 || slot == 57 || slot == 61 || slot == 62 ||
         slot == 67 || slot == 70 || slot == 74 || slot == 75 || slot == 76 || slot == 86 || slot == 101 || slot == 108 || slot == 133 ||
         slot == kCreateCommittedResource3X)
         return true;
