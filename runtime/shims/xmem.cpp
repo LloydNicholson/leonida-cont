@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <tuple>
 #include <limits>
 #include <map>
 #include <memory>
@@ -320,8 +321,8 @@ PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
 // XMemMapPhysicalPages. The guest page size sets the alignment and rounding of the region; the host's own pages stay
 // 4 KiB (host large pages need SeLockMemoryPrivilege). A 2 MiB region the host places is reserved 2 MiB-aligned through
 // VirtualAlloc2.
-void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
-    note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
+namespace {
+void* xmem_virtual_alloc_impl(void* address, SIZE_T size, DWORD allocation_type, DWORD protect) {
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
@@ -423,6 +424,29 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
                                                 &parameter, 1);
     }
     return VirtualAlloc(address, size, host_type, host_prot);
+}
+}  // namespace
+
+// Test-branch diagnostic: each distinct failing (type, attributes, protect) goes to stderr once, with the error, so a
+// boot that stops after a refused reservation names it.
+void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+    note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
+    void* const result = xmem_virtual_alloc_impl(address, size, allocation_type, protect);
+    if (!result) {
+        const DWORD error = GetLastError();
+        static std::mutex mutex;
+        static std::set<std::tuple<DWORD, ULONGLONG, DWORD>> seen;
+        const std::lock_guard lock(mutex);
+        if (seen.insert({allocation_type, attributes, protect}).second)
+            std::fprintf(stderr,
+                         "[rt] xmem: XMemVirtualAlloc(address %p, size 0x%llx, type 0x%lx, attributes 0x%llx, protect "
+                         "0x%lx) failed, error %lu\n",
+                         address, static_cast<unsigned long long>(size), static_cast<unsigned long>(allocation_type),
+                         static_cast<unsigned long long>(attributes), static_cast<unsigned long>(protect),
+                         static_cast<unsigned long>(error));
+        SetLastError(error);
+    }
+    return result;
 }
 
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
@@ -558,7 +582,8 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
 //
 // Each page is its own view (MapViewOfFile3 into a 64 KiB placeholder), so any page can be remapped or unmapped later
 // without touching its neighbours. A failure part-way leaves the pages before it mapped.
-void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint64_t* page_array) {
+namespace {
+void* xmem_map_physical_pages_impl(void* address, uint64_t page_count, const uint64_t* page_array) {
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
     if (!aligned_page_address(start) || page_count > (std::numeric_limits<uintptr_t>::max)() / kPhysicalPageSize ||
         start > (std::numeric_limits<uintptr_t>::max)() - page_count * kPhysicalPageSize) {
@@ -586,6 +611,22 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         if (!map_page(start + i * kPhysicalPageSize, page_array[i], protect)) return nullptr;
     }
     return address;
+}
+}  // namespace
+
+// Test-branch diagnostic: the first failing map goes to stderr, with the error.
+void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint64_t* page_array) {
+    void* const result = xmem_map_physical_pages_impl(address, page_count, page_array);
+    if (!result) {
+        const DWORD error = GetLastError();
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true))
+            std::fprintf(stderr, "[rt] xmem: XMemMapPhysicalPages(address %p, %llu pages, %s) failed, error %lu\n",
+                         address, static_cast<unsigned long long>(page_count), page_array ? "map" : "unmap",
+                         static_cast<unsigned long>(error));
+        SetLastError(error);
+    }
+    return result;
 }
 
 // BOOL XMemMapPhysicalPagesScatter(PVOID* addresses, UINT32 pageCount, UINT64* pageArray). Measured at two call sites:
