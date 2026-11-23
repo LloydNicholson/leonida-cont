@@ -2566,6 +2566,8 @@ void log_failed_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, std::uint64_
     for (UINT n = 0; desc && desc->pArgumentDescs && n < count; ++n)
         std::fprintf(stderr, " %u", argument_type(desc->pArgumentDescs[n]));
     std::fprintf(stderr, "\n");
+}
+
 // The Xbox slot 61 is CreateSamplerX(desc, dest): a sampler written to a CPU descriptor handle, with the PC
 // CreateSampler's two arguments. Measured on the retail title's boot (stop 20 in #6910's RT-5 measurements): the
 // title calls it once per sampler after its descriptor heaps exist, and it goes on when the call is served by the PC
