@@ -125,6 +125,28 @@ The output is game data and must stay in your work folder. `tests/test_shader_li
 archives by hand and covers the header, both tables, the size checks, the search in an archive and the digest
 walk. It also checks the `--carve` copy and the translator's reads of the compute sidecar.
 
+### Slot-57 graphics cache
+
+The slot-57 graphics runtime ([#8890](https://github.com/ItsNotRexed/Leonida/pull/8890)) looks up graphics
+modules by the full SHA-256 of the native program. Build the runtime sub-index from the graphics library's
+translated output.
+
+```sh
+python -I tools/shader_library.py <package>/shaders.rpf --out <work>/library --stages vs,ps,ms,gs --disasm --carve <work>/shaders/dxbc
+python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv --wave64-emulate --no-asm
+python -I tools/pack_fspx_gfx.py <work>/library/spirv --out <work>/shaders/spirv/fspx_gfx
+```
+
+Use a fresh translation directory and keep the translator's default SPIR-V validation enabled. The packer
+copies the VS, PS, MS and GS modules as `<sha256>.spv` and preserves their translation metadata in
+`fspx_gfx/index.json`. The runtime shader root must exist and the `fspx_gfx` directory must be new.
+
+For a specific boot repro, add `--require-hashes <path>` with one full native program digest per line. The
+packer includes just those digests and fails if any are absent from the translated graphics index. With or
+without a list, each selected digest must resolve to one module with consistent metadata. Byte-identical copies
+with the same metadata collapse into one entry. The runtime index is published only after all selected modules
+have been written. Keep the cache in the local work folder.
+
 ## 5. Translation
 
 With `--carve` and `rdna2spirv.py` at `main` `aa2988cc` (llvm-mc 23, `gfx1013`), **17,955 of the 21,522 programs
