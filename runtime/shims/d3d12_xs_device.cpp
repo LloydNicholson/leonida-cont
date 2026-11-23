@@ -106,6 +106,8 @@ struct DeviceProxy {
     std::atomic<std::uint32_t> frame_interval_us{0};
     std::atomic<std::uint32_t> frame_latency{1};
     std::atomic<bool> frame_event_scheduled{false};
+    std::atomic<std::uint32_t> frame_event_id{0};         // test branch: ScheduleFrameEventX's event, replayed below
+    std::atomic<std::uint32_t> frame_event_offset_us{0};  // test branch: and its offset
     std::shared_ptr<leonida::FrameTokenSource> frame_tokens = std::make_shared<leonida::FrameTokenSource>();
 };
 
@@ -1357,7 +1359,30 @@ PresentState* present_state_for(DeviceProxy* device) {
     // never issued, so the presentation numbers from the device's source rather than one of its own.
     state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), nullptr, device->frame_tokens);
     std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p)\n", static_cast<void*>(state->window));
+    // Test branch: the title registers its frame interval and origin event on the device (slots 78/79) before its
+    // first PresentX builds this presentation. Without them the pacer is unregistered, every present goes out with
+    // sync interval 0 and the frame loop runs unpaced (about 1500 frames a second on the retail title). So the values
+    // the device stored are handed to the pacer now; later calls reach it through device_presentation.
+    const std::uint32_t interval_us = device->frame_interval_us.load(std::memory_order_relaxed);
+    if (interval_us) {
+        const HRESULT interval_hr =
+            state->xbox->SetFrameIntervalX(nullptr, interval_us, device->frame_latency.load(std::memory_order_relaxed), 0);
+        HRESULT schedule_hr = S_FALSE;
+        if (device->frame_event_scheduled.load(std::memory_order_relaxed))
+            schedule_hr = state->xbox->ScheduleFrameEventX(device->frame_event_id.load(std::memory_order_relaxed),
+                                                           device->frame_event_offset_us.load(std::memory_order_relaxed), 0);
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: PresentX pacer takes the device's frame interval %u us (0x%08lx) and origin event "
+                     "(0x%08lx)\n",
+                     interval_us, static_cast<unsigned long>(interval_hr), static_cast<unsigned long>(schedule_hr));
+    }
     return state;
+}
+
+// Test branch: the device's presentation once a PresentX has built it, else null (slots 78/79/80 never build one).
+rt::d3d12::XboxPresentation* device_presentation(DeviceProxy* device) {
+    auto* state = static_cast<PresentState*>(device->present_state);
+    return state ? state->xbox.get() : nullptr;
 }
 
 std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::uint64_t planes,
@@ -1389,6 +1414,13 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
 #else  // !LEONIDA_VULKAN_DEVICE: this translation unit stands alone (mock and COM tests)
 
 void destroy_present_state(void*) {}
+
+struct NoPresentation {
+    HRESULT SetFrameIntervalX(void*, UINT, UINT, UINT) { return S_OK; }
+    HRESULT ScheduleFrameEventX(UINT, UINT, UINT) { return S_OK; }
+    HRESULT WaitFrameEventX(UINT, DWORD, UINT, std::uint64_t*) { return E_NOTIMPL; }
+};
+NoPresentation* device_presentation(DeviceProxy*) { return nullptr; }
 
 std::uint64_t queue_present_x(ChildProxy*, std::uint64_t, std::uint64_t, std::uint64_t) {
     return hr_to_u64(S_OK);
@@ -2327,16 +2359,20 @@ HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std:
     (void)flags;
     self->frame_interval_us.store(static_cast<std::uint32_t>(interval_us), std::memory_order_relaxed);
     self->frame_latency.store(static_cast<std::uint32_t>(latency ? latency : 1), std::memory_order_relaxed);
+    if (auto* xbox = device_presentation(self))  // test branch: the pacer behind PresentX follows it
+        xbox->SetFrameIntervalX(nullptr, static_cast<UINT>(interval_us), static_cast<UINT>(latency ? latency : 1), 0);
     return S_OK;
 }
 
 // Xbox device slot 79 (public HLE): ScheduleFrameEventX(event, offset_us, pEvent, flags); our pacer has only the origin.
 HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t offset_us,
                                      std::uint64_t flags) {
-    (void)event;
-    (void)offset_us;
     (void)flags;
+    self->frame_event_id.store(static_cast<std::uint32_t>(event), std::memory_order_relaxed);
+    self->frame_event_offset_us.store(static_cast<std::uint32_t>(offset_us), std::memory_order_relaxed);
     self->frame_event_scheduled.store(true, std::memory_order_relaxed);
+    if (auto* xbox = device_presentation(self))  // test branch: the pacer behind PresentX follows it
+        xbox->ScheduleFrameEventX(static_cast<UINT>(event), static_cast<UINT>(offset_us), 0);
     return S_OK;
 }
 
@@ -2350,6 +2386,24 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
     (void)flags;
     auto* token = reinterpret_cast<std::uint64_t*>(token_word);
     if (!token) return E_POINTER;
+    // Test branch: once a PresentX has built the presentation, the wait is the pacer's, so the title's frame loop runs
+    // at its registered interval. The word read as the timeout is 0 in the retail title's calls (unmeasured meaning),
+    // and a zero-timeout pacer wait never blocks, so the wait is bounded at 100 ms instead; a timeout, an unregistered
+    // pacer or any other failure falls back to the immediate token, so the title never stalls on it.
+    if (auto* xbox = device_presentation(self)) {
+        constexpr DWORD kPacedWaitMs = 100;
+        const HRESULT hr = xbox->WaitFrameEventX(static_cast<UINT>(event), kPacedWaitMs, 0, token);
+        if (SUCCEEDED(hr)) return S_OK;
+        static std::mutex mutex;
+        static std::set<HRESULT> seen;
+        const std::lock_guard lock(mutex);
+        if (seen.insert(hr).second)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: WaitFrameEventX on the PresentX pacer failed 0x%08lx (event %llu, title timeout "
+                         "word %llu, flags 0x%llx); an immediate token instead\n",
+                         static_cast<unsigned long>(hr), static_cast<unsigned long long>(event),
+                         static_cast<unsigned long long>(timeout_ms), static_cast<unsigned long long>(flags));
+    }
     *token = self->frame_tokens->issue();
     return S_OK;
 }
