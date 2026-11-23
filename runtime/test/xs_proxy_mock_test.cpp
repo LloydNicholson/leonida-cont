@@ -147,9 +147,6 @@ bool mock_has(const Mock* m, REFIID iid) {
         case Kind::fence:
             return IsEqualIID(iid, __uuidof(ID3D12Fence)) || (m->fence1 && IsEqualIID(iid, __uuidof(ID3D12Fence1)));
         case Kind::resource: return IsEqualIID(iid, __uuidof(ID3D12Resource));
-        case Kind::command_list:
-            return IsEqualIID(iid, __uuidof(ID3D12CommandList)) ||
-                   IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList));
         case Kind::allocator:
             return IsEqualIID(iid, __uuidof(ID3D12CommandAllocator)) ||
                    (m->allocator_tag && IsEqualIID(iid, xs::kLeonidaCommandAllocatorTag));
@@ -807,11 +804,28 @@ int check_xbox_slots() {
     EXPECT(mock->args[12][2] == word(real_allocator) && mock->args[12][3] == 0);
     // The real list is created as ID3D12GraphicsCommandList; the console IID the caller asked for is answered by
     // the proxy's QueryInterface instead.
-    EXPECT(mock->args[12][4] == word(&__uuidof(ID3D12GraphicsCommandList)));
+    EXPECT(IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), __uuidof(ID3D12GraphicsCommandList)));
 
     // Release the list before the refusal calls below: the COM convention (and the handler) nulls the caller's
     // output on failure, so an invalid call would clear this pointer.
     EXPECT(release(list) == 0);
+
+    // An IID the PC does not know (the console's own list IID; this one is made up for the test) still gets a list:
+    // the console list proxy, not a failure from the PC device.
+    // {8d2c4f61-3a5e-4b7c-9e10-2f6a8b4c3d51}
+    constexpr GUID kConsoleListIid{0x8d2c4f61, 0x3a5e, 0x4b7c, {0x9e, 0x10, 0x2f, 0x6a, 0x8b, 0x4c, 0x3d, 0x51}};
+    void* console_list = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&kConsoleListIid), word(&console_list))) ==
+           S_OK);
+    EXPECT(xs::is_list_proxy(console_list) && mock->calls[12] == 2 && mock->calls[73] == 0);
+    EXPECT(IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), list_iid));
+    EXPECT(release(console_list) == 0);
+    // A PC list IID the proxy answers is returned as asked.
+    const IID list1_iid = __uuidof(ID3D12GraphicsCommandList1);
+    void* list1 = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list1_iid), word(&list1))) == S_OK);
+    EXPECT(xs::is_list_proxy(list1) && mock->calls[12] == 3);
+    EXPECT(release(list1) == 0);
 
     // Missing description, allocator or output: E_INVALIDARG/E_POINTER before the real device is called.
     EXPECT(hr_of(raw(device, 73, 0, word(allocator), 0, word(&list_iid), word(&list))) == E_INVALIDARG);
