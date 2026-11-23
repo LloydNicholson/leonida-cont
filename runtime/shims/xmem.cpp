@@ -432,6 +432,13 @@ void* xmem_virtual_alloc_impl(void* address, SIZE_T size, DWORD allocation_type,
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
     void* const result = xmem_virtual_alloc_impl(address, size, allocation_type, protect);
+    if (result && (allocation_type & (MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER))) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 32)
+            std::fprintf(stderr, "[rt] xmem: XMemVirtualAlloc(address %p, size 0x%llx, type 0x%lx, attributes 0x%llx) -> %p\n",
+                         address, static_cast<unsigned long long>(size), static_cast<unsigned long>(allocation_type),
+                         static_cast<unsigned long long>(attributes), result);
+    }
     if (!result) {
         const DWORD error = GetLastError();
         static std::mutex mutex;
@@ -463,20 +470,28 @@ bool unmap_page(uintptr_t address) {
 
 // With g_phys_mutex held. Maps physical page `page` (0: unmap) at the 64 KiB-aligned `address`, replacing what was
 // mapped there. The caller has found the window.
+// Test-branch diagnostic: which step of the last failing map_page failed.
+thread_local const char* g_map_stage = "";
+
 bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
+    g_map_stage = "unmap the page already there";
     if (!unmap_page(address)) return false;
     if (page == 0) return true;
     const auto it = g_pages.find(page);
     if (it == g_pages.end()) {
+        g_map_stage = "page number not allocated by XMemAllocatePhysicalPages";
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
     void* const target = reinterpret_cast<void*>(address);
+    g_map_stage = "split the placeholder (VirtualFree MEM_PRESERVE_PLACEHOLDER)";
     if (!isolate_placeholder(target, kPhysicalPageSize)) return false;
+    g_map_stage = "MapViewOfFile3 MEM_REPLACE_PLACEHOLDER";
     void* const view = placeholder_api().map_view3(it->second.section->handle, GetCurrentProcess(), target,
                                                    it->second.offset, kPhysicalPageSize, MEM_REPLACE_PLACEHOLDER,
                                                    protect, nullptr, 0);
     if (!view) return false;
+    g_map_stage = "";
     g_mapped[address] = page;
     return true;
 }
@@ -608,7 +623,21 @@ void* xmem_map_physical_pages_impl(void* address, uint64_t page_count, const uin
     }
     const DWORD protect = view_protect(*window);
     for (uint64_t i = 0; i < page_count; ++i) {
-        if (!map_page(start + i * kPhysicalPageSize, page_array[i], protect)) return nullptr;
+        if (!map_page(start + i * kPhysicalPageSize, page_array[i], protect)) {
+            const DWORD error = GetLastError();
+            MEMORY_BASIC_INFORMATION info{};
+            VirtualQuery(reinterpret_cast<void*>(start + i * kPhysicalPageSize), &info, sizeof(info));
+            std::fprintf(stderr,
+                         "[rt] xmem: map page %llu of %llu (page number 0x%llx) failed at: %s; region base %p size "
+                         "0x%llx state 0x%lx type 0x%lx; window size 0x%llx\n",
+                         static_cast<unsigned long long>(i), static_cast<unsigned long long>(page_count),
+                         static_cast<unsigned long long>(page_array[i]), g_map_stage, info.AllocationBase,
+                         static_cast<unsigned long long>(info.RegionSize), static_cast<unsigned long>(info.State),
+                         static_cast<unsigned long>(info.Type),
+                         static_cast<unsigned long long>(window->size));
+            SetLastError(error);
+            return nullptr;
+        }
     }
     return address;
 }
