@@ -2961,7 +2961,10 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
 - *Frame pacing* (`FramePacer`, time from an injectable clock; real time is a steady timer, a host vblank source
   can replace it). `SetFrameIntervalX` takes the interval as a period in microseconds and the latency, and starts
   the vblank grid. `ScheduleFrameEventX` arms the origin event, delayed by an offset inside the frame.
-  `WaitFrameEventX` returns at the next origin with the next token (1, 2, 3, ...; 0 is the null token) and does not
+  After the origin is armed, event type 2 can be scheduled at its own offset with zero flags. Missed signals
+  coalesce. A type 2 wait leaves the token untouched and runs independently of frame latency, following the
+  secondary event observed in [XCL's frame clock](https://github.com/ivall/xcl/blob/95bda116cfc1b118156901984052ff5698dbf4cc/crates/xcl/src/hle/d3d12x/frame.rs).
+  For an origin, `WaitFrameEventX` returns with the next token (1, 2, 3, ...; 0 is the null token) and does not
   return while `latency` presented frames are still waiting for their vblank. A frame presented before the origin event
   is armed is not paced (`PresentX` does not hold it for a vblank), so it is shown at once and never waits for a vblank:
   blank presents of a loading screen do not delay the first wait. A wait that comes late returns at once

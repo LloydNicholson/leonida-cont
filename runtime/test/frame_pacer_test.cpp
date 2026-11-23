@@ -531,6 +531,45 @@ int main() {
         EXPECT(pacer.frames_in_flight() == 1);
     }
 
+    // The secondary event has a separate repeating deadline and never issues frame tokens.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        std::uint64_t token = 77;
+        EXPECT(pacer.set_frame_interval(1000, 1, 0) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_type_2, 200, 0) == pacer_hr::invalid_state);
+        EXPECT(pacer.schedule_frame_event(frame_event_origin, 0, 0) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_type_2, 200, 0) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_type_2, 1000, 0) == pacer_hr::invalid_arg);
+        EXPECT(pacer.schedule_frame_event(frame_event_type_2, 200, 1) == pacer_hr::invalid_arg);
+        EXPECT(pacer.wait_frame_event(frame_event_type_2, 0, 1, nullptr) == pacer_hr::invalid_arg);
+        pacer.note_untokened_present();
+        clock.advance_us(199);
+        EXPECT(pacer.wait_frame_event(frame_event_type_2, 0, 0, nullptr) == pacer_hr::timeout);
+        clock.advance_us(1);
+        EXPECT(pacer.frames_in_flight() == 1);
+        EXPECT(pacer.wait_frame_event(frame_event_type_2, 0, 0, &token) == pacer_hr::ok && token == 77);
+        EXPECT(pacer.wait_frame_event(frame_event_type_2, 0, 0, nullptr) == pacer_hr::timeout);
+        clock.advance_us(800);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == 1);
+        clock.advance_us(200);
+        EXPECT(pacer.wait_frame_event(frame_event_type_2, 0, 0, nullptr) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_type_2, 0, 0) == pacer_hr::ok);
+        clock.advance_us(800);
+        EXPECT(pacer.wait_frame_event(frame_event_type_2, 0, 0, nullptr) == pacer_hr::ok);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == 2);
+        // Rebase a running registration, then let several events pass before consuming the signal.
+        EXPECT(pacer.set_frame_interval(500, 1, 0) == pacer_hr::ok);
+        clock.advance_us(499);
+        EXPECT(pacer.wait_frame_event(frame_event_type_2, 0, 0, nullptr) == pacer_hr::timeout);
+        clock.advance_us(1001);
+        EXPECT(pacer.wait_frame_event(frame_event_type_2, 0, 0, nullptr) == pacer_hr::ok);
+        EXPECT(pacer.wait_frame_event(frame_event_type_2, 0, 0, nullptr) == pacer_hr::timeout);
+        pacer.suspend();
+        pacer.resume();
+        EXPECT(pacer.wait_frame_event(frame_event_type_2, 0, 0, nullptr) == pacer_hr::invalid_state);
+    }
+
     // Real clock: five 10 ms vblanks take about 50 ms.
     {
         SteadyFrameClock clock;

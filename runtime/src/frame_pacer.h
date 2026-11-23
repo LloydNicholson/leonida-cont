@@ -15,11 +15,11 @@
 //     first origin after ScheduleFrameEventX is the next vblank. The origin event of vblank n is signalled
 //     offset microseconds after it (ScheduleFrameEventX's offset).
 //   * A frame is "in flight" from PresentX until the vblank that shows it. Frames show one per vblank, in order.
-//     WaitFrameEventX does not return while `latency` frames are in flight. A frame presented while the origin event
+//     An origin wait does not return while `latency` frames are in flight. A frame presented while the origin event
 //     is not armed is not paced (PresentX does not hold it for a vblank): it shows at once and is never in flight.
 //   * A wait that comes late (after the next origin already passed) returns at once with the newest passed origin;
 //     the missed origins are skipped, not queued.
-//   * Tokens are 1, 2, 3, ... (0 is the null token), one per successful wait, never reused, across suspend/resume.
+//   * Tokens are 1, 2, 3, ... (0 is the null token), one per successful origin wait, never reused, across suspend/resume.
 //   * A frame is due at the vblank after the origin that handed out its token; a PresentX after that vblank is late by
 //     the time since it (present_timing), and ImmediateThresholdPercent decides whether that lateness is shown at once
 //     (decide_present_sync).
@@ -101,6 +101,8 @@ private:
 
 // Provisional definitions of ours: the real constants and layouts of the console API are unmeasured.
 inline constexpr std::uint32_t frame_event_origin = 0;
+// XCL models numeric event 2 as a separate point on the interval grid (docs/d3d12_vulkan.md, frame pacing).
+inline constexpr std::uint32_t frame_event_type_2 = 2;
 // Statistics types (bit mask). Interval and render entries are never produced here.
 inline constexpr std::uint32_t stat_frame_interval = 0x01;
 inline constexpr std::uint32_t stat_frame_event = 0x02;
@@ -186,17 +188,29 @@ public:
         interval_set_ = true;
         offset_us_ = std::min(offset_us_, period_us - 1);
         last_origin_ = 0;  // origin 0 is the epoch itself, which has passed
+        if (phase2_armed_) {
+            phase2_offset_us_ = std::min(phase2_offset_us_, period_us - 1);
+            phase2_next_us_ = next_phase2_after(epoch_us_);
+        }
         cv_.notify_all();
         return pacer_hr::ok;
     }
 
-    // ScheduleFrameEventX(event, offset, ..., flags). Only the origin event exists here.
+    // ScheduleFrameEventX(event, offset, ..., flags). The two events keep independent schedules.
     std::int32_t schedule_frame_event(std::uint32_t event, std::uint32_t offset_us, std::uint32_t flags) {
-        (void)flags;
-        if (event != frame_event_origin) return pacer_hr::invalid_arg;
+        if (event != frame_event_origin && event != frame_event_type_2) return pacer_hr::invalid_arg;
         std::lock_guard guard(mutex_);
         if (suspended_ || !interval_set_) return pacer_hr::invalid_state;
         if (offset_us >= period_us_) return pacer_hr::invalid_arg;
+        if (event == frame_event_type_2) {
+            if (!armed_) return pacer_hr::invalid_state;
+            if (flags != 0) return pacer_hr::invalid_arg;
+            phase2_offset_us_ = offset_us;
+            phase2_next_us_ = next_phase2_after(clock_.now_us());
+            phase2_armed_ = true;
+            cv_.notify_all();
+            return pacer_hr::ok;
+        }
         offset_us_ = offset_us;
         armed_ = true;
         // The first origin is the next one that has not come yet: origin n is due at epoch + n * period + offset.
@@ -206,16 +220,17 @@ public:
         return pacer_hr::ok;
     }
 
-    // WaitFrameEventX(event, timeout, ..., flags, &token). Blocks until the next origin, and while `latency` frames
-    // are in flight. pacer_hr::timeout when `timeout_ms` passes first (infinite_timeout_ms: never); the token is left
-    // alone then. invalid_state when nothing is registered, the pacer is suspended, or one of those happens while waiting.
+    // The origin waits for frame latency and issues a token; type 2 waits for its own point on the grid.
+    // A finite wait times out when its deadline passes first. Suspension invalidates both registrations.
     std::int32_t wait_frame_event(std::uint32_t event, std::uint32_t timeout_ms, std::uint32_t flags,
                                   std::uint64_t* token) {
-        (void)flags;
-        if (event != frame_event_origin || !token) return pacer_hr::invalid_arg;
+        if (event != frame_event_origin && event != frame_event_type_2) return pacer_hr::invalid_arg;
+        if (event == frame_event_origin && !token) return pacer_hr::invalid_arg;
+        if (event == frame_event_type_2 && flags != 0) return pacer_hr::invalid_arg;
         std::unique_lock lock(mutex_);
         ++waiters_;
-        const std::int32_t result = wait_locked(lock, timeout_ms, token);
+        const std::int32_t result = event == frame_event_type_2
+            ? wait_phase2_locked(lock, timeout_ms) : wait_locked(lock, timeout_ms, token);
         if (--waiters_ == 0) cv_.notify_all();
         return result;
     }
@@ -351,7 +366,7 @@ public:
     void suspend() {
         std::lock_guard guard(mutex_);
         suspended_ = true;
-        interval_set_ = armed_ = false;
+        interval_set_ = armed_ = phase2_armed_ = false;
         pending_.clear();
         cv_.notify_all();
     }
@@ -359,7 +374,7 @@ public:
     void resume() {
         std::lock_guard guard(mutex_);
         suspended_ = false;
-        interval_set_ = armed_ = false;
+        interval_set_ = armed_ = phase2_armed_ = false;
         cv_.notify_all();
     }
 
@@ -399,6 +414,28 @@ private:
                     r.percent_scanned = pending_.front().percent_scanned;
                 }
             pending_.pop_front();
+        }
+    }
+
+    std::uint64_t next_phase2_after(std::uint64_t now) const {
+        const std::uint64_t first = epoch_us_ + phase2_offset_us_;
+        if (now < first) return first;
+        return first + ((now - first) / period_us_ + 1) * period_us_;
+    }
+
+    // A secondary event is consumed independently and can coalesce missed intervals. Only origins issue tokens.
+    std::int32_t wait_phase2_locked(std::unique_lock<std::mutex>& lock, std::uint32_t timeout_ms) {
+        const auto stop = timeout_ms == infinite_timeout_ms ? no_deadline
+                                                            : clock_.now_us() + std::uint64_t(timeout_ms) * 1000;
+        for (;;) {
+            if (shutdown_ || suspended_ || !phase2_armed_) return pacer_hr::invalid_state;
+            const auto now = clock_.now_us();
+            if (now >= phase2_next_us_ && phase2_next_us_ <= stop) {
+                phase2_next_us_ = next_phase2_after(now);
+                return pacer_hr::ok;
+            }
+            if (now >= stop) return pacer_hr::timeout;
+            clock_.wait(lock, cv_, std::min(stop, phase2_next_us_));
         }
     }
 
@@ -444,6 +481,9 @@ private:
     bool suspended_ = false;
     bool interval_set_ = false;
     bool armed_ = false;
+    bool phase2_armed_ = false;
+    std::uint32_t phase2_offset_us_ = 0;
+    std::uint64_t phase2_next_us_ = 0;
     std::uint32_t period_us_ = 0;
     std::uint32_t latency_ = 1;
     std::uint32_t offset_us_ = 0;

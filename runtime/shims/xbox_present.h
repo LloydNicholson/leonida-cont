@@ -102,12 +102,12 @@ public:
     // window. `interval_period_us` is the period of a frame interval, e.g. xbox_frame_interval_60hz_us; `latency`
     // is the frames allowed in flight (the samples pass the buffer count minus 1, or 1).
     HRESULT SetFrameIntervalX(IUnknown* output, UINT interval_period_us, UINT latency, UINT flags);
-    // Only the origin event (xbox_frame_event_origin) exists. `offset_us` delays it inside the frame. The pointer
-    // argument the samples pass as null is not modelled.
+    // Schedule the origin, or numeric event 2 after the origin is armed. Both take an offset inside the frame.
+    // The secondary event supports zero flags and a null ancillary argument.
     HRESULT ScheduleFrameEventX(UINT event, UINT offset_us, UINT flags);
-    // Blocks for the next origin and while the latency is used up. HRESULT_FROM_WIN32(WAIT_TIMEOUT) after `timeout_ms`
-    // (INFINITE waits for ever); `*token` is untouched then. E_INVALIDARG for a null token pointer or another event;
-    // HRESULT_FROM_WIN32(ERROR_INVALID_STATE) when nothing is registered (not yet, or since SuspendX).
+    // Origin waits respect frame latency and require a token pointer. Type 2 waits for its own deadline and leaves
+    // the optional token untouched. A finite timeout gives HRESULT_FROM_WIN32(WAIT_TIMEOUT); an unregistered
+    // event gives HRESULT_FROM_WIN32(ERROR_INVALID_STATE).
     HRESULT WaitFrameEventX(UINT event, DWORD timeout_ms, UINT flags, std::uint64_t* token);
     // See FramePacer::get_frame_statistics: S_FALSE and count 0 when nothing is available.
     HRESULT GetFrameStatisticsX(std::uint64_t token, UINT type_mask, UINT* count, leonida::FrameStatistic* out);
