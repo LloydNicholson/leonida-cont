@@ -51,6 +51,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <tuple>
 #include <string>
 #include <type_traits>
 #include <cwchar>
@@ -8165,6 +8166,19 @@ private:
         const Format format = state_.texture_format(desc);
         if (!format.format) {
             log_once("GetResourceAllocationInfo format not supported yet:", desc.Format);
+            // Test-branch diagnostic: the refused description's shape, once per distinct (format, dimension, flags).
+            {
+                static std::mutex seen_mutex;
+                static std::set<std::tuple<int, int, unsigned>> seen;
+                const std::lock_guard lock(seen_mutex);
+                if (seen.insert({int(desc.Format), int(desc.Dimension), unsigned(desc.Flags)}).second)
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: refused texture: format %d dimension %d %llux%ux%u mips %u samples %u "
+                                 "layout 0x%x flags 0x%x\n",
+                                 int(desc.Format), int(desc.Dimension), static_cast<unsigned long long>(desc.Width),
+                                 desc.Height, unsigned(desc.DepthOrArraySize), unsigned(desc.MipLevels),
+                                 desc.SampleDesc.Count, unsigned(desc.Layout), unsigned(desc.Flags));
+            }
             return kInvalidAllocation;
         }
         VkMemoryRequirements need{};
