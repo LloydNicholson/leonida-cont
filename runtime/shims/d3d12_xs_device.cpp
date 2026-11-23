@@ -50,6 +50,8 @@
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <tuple>
+#include <set>
 #include <new>
 #include <vector>
 #include <memory>
@@ -2536,7 +2538,23 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
                      desc->ByteStride);
     D3D12_COMMAND_SIGNATURE_DESC pc = *desc;
     pc.pArgumentDescs = args.get();
-    return forward(self->real, &pc, root_signature, riid, out);
+    const HRESULT hr = forward(self->real, &pc, root_signature, riid, out);
+    // Test-branch diagnostic: a failing console signature, once per distinct (count, stride, result).
+    if (FAILED(hr)) {
+        static std::mutex mutex;
+        static std::set<std::tuple<UINT, UINT, HRESULT>> seen;
+        const std::lock_guard lock(mutex);
+        if (seen.insert({desc->NumArgumentDescs, desc->ByteStride, hr}).second) {
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 41 CreateCommandSignature failed 0x%08lx: %u argument(s), stride %u, "
+                                 "root signature %s, types:",
+                         static_cast<unsigned long>(hr), desc->NumArgumentDescs, desc->ByteStride,
+                         root_signature ? "set" : "null");
+            for (UINT i = 0; i < desc->NumArgumentDescs; ++i)
+                std::fprintf(stderr, " %u", argument_type(desc->pArgumentDescs[i]));
+            std::fprintf(stderr, "\n");
+        }
+    }
+    return hr;
 }
 
 // The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out), named
