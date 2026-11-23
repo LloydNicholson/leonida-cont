@@ -19,6 +19,7 @@
 #include <cstring>
 #include <mutex>
 #include <set>
+#include <source_location>
 #include <string>
 #include <thread>
 #include <utility>
@@ -216,9 +217,20 @@ public:
     // reports it.
     HRESULT STDMETHODCALLTYPE Close() override {
         constexpr auto method = "ID3D12GraphicsCommandList::Close";
-        if (list_.queries_open()) invalid_ = true;
+        const bool queries_open = list_.queries_open();
+        if (queries_open) invalid_ = true;
         if (!list_.close()) return d3d12_trace::result(method, E_FAIL);
         stop_recording();
+        if (invalid_) {  // test-branch diagnostic: why Close fails, once per distinct cause
+            static std::mutex seen_mutex;
+            static std::set<std::uint_least32_t> seen;
+            const std::lock_guard lock(seen_mutex);
+            const std::uint_least32_t line = first_invalid_.line();
+            if (seen.insert(line).second)
+                std::fprintf(stderr, "[rt] d3d12: Close returns E_INVALIDARG: %s (d3d12_com.cpp line %u)\n",
+                             line ? first_invalid_.function_name() : "a query was begun and not ended",
+                             static_cast<unsigned>(line));
+        }
         return d3d12_trace::result(method, invalid_ ? E_INVALIDARG : S_OK);
     }
 
@@ -1008,8 +1020,10 @@ private:
         return out;
     }
 
-    void check(bool ok) {
-        if (!ok) invalid_ = true;
+    void check(bool ok, std::source_location where = std::source_location::current()) {
+        if (ok) return;
+        if (!invalid_) first_invalid_ = where;  // test-branch diagnostic: the first refused call, logged at Close
+        invalid_ = true;
     }
 
     void stop_recording() {
@@ -1187,6 +1201,7 @@ private:
     CommandAllocator* allocator_ = nullptr;  // referenced while the list is open
     leonida::CommandList list_;
     bool invalid_ = false;
+    std::source_location first_invalid_{};  // test-branch diagnostic
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
     RootState compute_;
