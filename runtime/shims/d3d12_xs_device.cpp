@@ -1364,10 +1364,26 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
                               std::uint64_t params) {
     PresentState* state = self->device ? present_state_for(self->device) : nullptr;
     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
-    return hr_to_u64(state->xbox->PresentX(
+    const HRESULT hr = state->xbox->PresentX(
         static_cast<UINT>(plane_count),
         reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
-        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params)));
+        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params));
+    // Test-branch diagnostic: each distinct failing PresentX result once, and the count of successful presents at
+    // 1, 10, 100, 1000 and every 10000th.
+    if (FAILED(hr)) {
+        static std::mutex mutex;
+        static std::set<HRESULT> seen;
+        const std::lock_guard lock(mutex);
+        if (seen.insert(hr).second)
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX failed 0x%08lx (%llu plane(s))\n",
+                         static_cast<unsigned long>(hr), static_cast<unsigned long long>(plane_count));
+    } else {
+        static std::atomic<std::uint64_t> ok{0};
+        const std::uint64_t n = ok.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || n == 10 || n == 100 || n == 1000 || n % 10000 == 0)
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX succeeded %llu time(s)\n", static_cast<unsigned long long>(n));
+    }
+    return hr_to_u64(hr);
 }
 
 #else  // !LEONIDA_VULKAN_DEVICE: this translation unit stands alone (mock and COM tests)
