@@ -29,6 +29,7 @@
 #include "d3d12_xs_desc_clean.h"
 #include "../src/d3d12_xs_frame_events.h"
 #include "../src/frame_pacer.h"
+#include "../src/host_stall.h"
 #include "d3d12_xs_pso_stream.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
@@ -3245,6 +3246,7 @@ std::string lookup_xbox_fspx_program_stage_impl(const void* program_bytes, std::
     if (!g_fspx_stage_dir) g_fspx_stage_dir = new (std::nothrow) std::wstring();
     if (g_fspx_stage_lib && g_fspx_stage_dir && *g_fspx_stage_dir != dir) {
         *g_fspx_stage_dir = dir;
+        const rt::host_stall::Scope loading;  // test branch: a second parse of the fspx indexes
         g_fspx_stage_lib->load_fspx_only(std::filesystem::path(dir));
     }
     const leonida::ShaderEntry* entry = g_fspx_stage_lib ? g_fspx_stage_lib->find_fspx_by_code(hash) : nullptr;

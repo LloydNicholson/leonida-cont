@@ -888,6 +888,7 @@ struct DeviceState {
         std::lock_guard lock(library_mutex);
         if (!library_tried) {
             library_tried = true;
+            const rt::host_stall::Scope loading;  // test branch: parsing the shader indexes, about 97 MB of JSON
             // Nothing may leave here into Create*PipelineState: a path the STL cannot convert throws std::system_error
             // under MSVC, which is not a filesystem_error, so every std::exception gives the message.
             try {
@@ -3591,6 +3592,7 @@ public:
     // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
                             const D3D12_SHADER_BYTECODE* as = nullptr) {
+        const rt::host_stall::Scope building;  // test branch: reading, patching and compiling are all host-only
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
@@ -4220,6 +4222,7 @@ public:
     }
 
     HRESULT create_compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc) {
+        const rt::host_stall::Scope building;  // test branch: as create_graphics
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         if (!desc.CS.pShaderBytecode || !desc.CS.BytecodeLength) return E_INVALIDARG;
