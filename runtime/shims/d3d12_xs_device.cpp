@@ -3257,6 +3257,55 @@ std::string lookup_xbox_fspx_program_stage_impl(const void* program_bytes, std::
 
 std::atomic<std::uint64_t> g_slot57_calls{0};
 
+void keep_pso_stream(IUnknown* pso, const D3D12_PIPELINE_STATE_STREAM_DESC& desc);  // below, with slots 86 and 55
+
+// One subobject as the stream lays it out: the type word, then the payload at its own alignment, 8-aligned overall.
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, class T>
+struct alignas(void*) StreamPart {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
+    T value{};
+};
+
+// Test branch: a slot 57 pipeline keeps its description as a stream too, so slot 55 can derive from it (the retail
+// title's first slot 55 call has a slot 57 pipeline as its base). The slot 55 records carry the title's own blend,
+// depth and raster state over slot 57's defaults.
+void keep_native_graphics_stream(IUnknown* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) {
+    struct {
+        StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
+        StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
+        StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+        StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, D3D12_SHADER_BYTECODE> gs;
+        StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+        StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> mask;
+        StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> raster;
+        StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth;
+        StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, D3D12_INPUT_LAYOUT_DESC> layout;
+        StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
+        StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> targets;
+        StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> depth_format;
+        StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> samples;
+    } stream;
+    stream.root.value = d.pRootSignature;
+    stream.vs.value = d.VS;
+    stream.ps.value = d.PS;
+    stream.gs.value = d.GS;
+    stream.blend.value = d.BlendState;
+    stream.mask.value = d.SampleMask;
+    stream.raster.value = d.RasterizerState;
+    stream.depth.value = d.DepthStencilState;
+    stream.layout.value = d.InputLayout;
+    stream.topology.value = d.PrimitiveTopologyType;
+    stream.targets.value.NumRenderTargets = d.NumRenderTargets;
+    for (UINT i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
+        stream.targets.value.RTFormats[i] = i < d.NumRenderTargets ? d.RTVFormats[i] : DXGI_FORMAT_UNKNOWN;
+    stream.depth_format.value = d.DSVFormat;
+    stream.samples.value = d.SampleDesc;
+    D3D12_PIPELINE_STATE_STREAM_DESC desc{};
+    desc.SizeInBytes = sizeof(stream);
+    desc.pPipelineStateSubobjectStream = &stream;
+    keep_pso_stream(pso, desc);
+}
+
 HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, const void* desc,
                                                         const IID* riid, void** out) {
     if (!out) return E_POINTER;
@@ -3394,6 +3443,7 @@ HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, const
     pc_desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
 
     const HRESULT hr = self->real->CreateGraphicsPipelineState(&pc_desc, *riid, out);
+    if (SUCCEEDED(hr) && *out) keep_native_graphics_stream(static_cast<IUnknown*>(*out), pc_desc);
     if (FAILED(hr)) {
         static std::atomic<int> fail_log{0};
         if (fail_log.fetch_add(1, std::memory_order_relaxed) < 16)
@@ -3773,6 +3823,14 @@ HRESULT proxy_create_derived_pso(DeviceProxy* self, ID3D12PipelineState* base, s
     if (!out || !riid || !records) return E_POINTER;
     const PsoStreamRecord* base_record = base ? find_pso_record(base) : nullptr;
     if (!base_record) return refuse_derived(0, "base PSO has no kept stream", E_FAIL);
+    for (std::uint32_t i = 0; i < count && i < kDerivedMaxRecords; ++i) {  // test-branch diagnostic, once per tag
+        std::uint32_t tag = 0;
+        std::memcpy(&tag, records + i * kDerivedRecordSize, sizeof(tag));
+        static std::atomic<std::uint32_t> seen{0};
+        const std::uint32_t bit = 1u << (tag < 31 ? tag : 31);
+        if (!(seen.fetch_or(bit, std::memory_order_relaxed) & bit))
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 55 record tag %u seen (%u record(s) in the call)\n", tag, count);
+    }
     std::vector<unsigned char> patched;
     switch (derive_stream(*base_record, records, count, patched)) {
         case DeriveStatus::ok: break;
