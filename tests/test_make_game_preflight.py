@@ -142,6 +142,28 @@ class VersionParsingAndMatchingTest(PreflightTestBase):
             for name in make_game.PROBES:
                 self.assertIn(f"Missing {name}.", err)
 
+    def test_a_probe_whose_name_differs_only_in_case_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = make_game.versions()[0]
+            for probe_name in make_game.PROBES:
+                with open(os.path.join(tmp, probe_name.lower()), "wb") as f:
+                    f.truncate(manifest["files"][probe_name]["size"])
+            if os.path.exists(os.path.join(tmp, "MicrosoftGame.Config")):
+                self.skipTest("case-insensitive file system: the lower-cased names open under the package's")
+            mismatches = make_game.probe_mismatches(tmp, manifest)
+        self.assertIn("Missing MicrosoftGame.Config: there is microsoftgame.config, but file names are "
+                      "case-sensitive", mismatches[0])
+        self.assertIn("Rename it to MicrosoftGame.Config", mismatches[0])
+        self.assertIn("Missing Catalog000.bin: there is catalog000.bin", mismatches[1])
+        self.assertEqual(len(mismatches), 2)   # appdata0.rpf is lower case in the package too: it matches
+
+    def test_other_case_ignores_the_exact_name_and_unrelated_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("Catalog000.bin.bak", "Catalog000.bin"):
+                open(os.path.join(tmp, name), "wb").close()
+            self.assertIsNone(make_game.other_case(tmp, "Catalog000.bin"))
+            self.assertIsNone(make_game.other_case(os.path.join(tmp, "absent"), "Catalog000.bin"))
+
 
 class GameCheckTest(PreflightTestBase):
     def test_check_nonexistent_directory_fails(self):
@@ -651,7 +673,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             with mock.patch.object(make_game, "ROOT", tmp), \
                  mock.patch("shutil.which", return_value=None):
                 self.assert_fails(make_game.ensure_submodule,
-                                  match="git clone --recursive https://github.com/ItsNotRexed/Leonida")
+                                  match="git clone --recursive https://github.com/ubiquitarianism/leonida")
 
     def test_ensure_submodule_zip_with_git_does_not_say_install_git(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -660,8 +682,20 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                  mock.patch("shutil.which", return_value="/usr/bin/git"), \
                  mock.patch("subprocess.run", return_value=not_a_repo):
                 err = self.assert_fails(make_game.ensure_submodule,
-                                        match="git clone --recursive https://github.com/ItsNotRexed/Leonida")
+                                        match="git clone --recursive https://github.com/ubiquitarianism/leonida")
                 self.assertNotIn("Install Git", err)
+
+    def test_ensure_submodule_names_the_clone_command_the_readme_gives(self):
+        # the hint once named a repository that had gone private; the README is where the address is kept current
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(make_game, "ROOT", tmp), \
+                 mock.patch("shutil.which", return_value=None):
+                err = self.assert_fails(make_game.ensure_submodule, match="git clone --recursive ")
+        clone = re.search(r"git clone --recursive https://github\.com/[\w.-]+/[\w.-]+", err)
+        self.assertIsNotNone(clone, err)
+        self.assertIn(f"`{clone.group(0)}`", readme)
 
     def test_ensure_submodule_failed_fetch_in_clone_names_the_fetch(self):
         with tempfile.TemporaryDirectory() as tmp:

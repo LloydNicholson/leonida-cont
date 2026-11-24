@@ -5,6 +5,8 @@
 Every input is written here by hand (Markdown tables, JUnit XML, a CTest log, a fake work folder whose shader names
 are sentinels). No game files, no GPU, no network: the GitHub path is fed synthetic gh output.
 """
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -247,6 +249,32 @@ class Freshness(unittest.TestCase):
         self.assertEqual((metric["numerator"], metric["denominator"]), (2, 6))
 
 
+    def test_local_ctest_junit_replaces_log_and_keeps_independent_run(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pd, "ROOT", tmp), \
+                mock.patch.object(pd, "last_commit_time", return_value=0):
+            log = Path(tmp, "runtime/build/Testing/Temporary/LastTest.log")
+            log.parent.mkdir(parents=True)
+            log.write_text("1/1 Test: probe\nTest Passed.\n", encoding="utf-8")
+            local = Path(tmp, "local.xml")
+            local.write_text('<testsuite disabled="0" hostname="host"><testcase name="probe">'
+                             '<skipped/></testcase></testsuite>', encoding="utf-8")
+            other = Path(tmp, "other.xml")
+            other.write_text('<testsuites><testsuite><testcase name="probe"/></testsuite></testsuites>', encoding="utf-8")
+            col = pd.Collector()
+            pd.collect_ctest(col, SimpleNamespace(ctest_junit=str(local), junit=[str(local), str(other)]))
+            self.assertEqual([(c["group"], c["status"]) for c in col.components],
+                             [("ctest", "unknown"), ("junit:other.xml", "verified")])
+            metric = next(m for m in col.metrics if m["id"] == "runtime.current")
+            self.assertEqual((metric["numerator"], metric["denominator"]), (1, 2))
+
+            for path, status in [(other, "invalid"), (Path(tmp, "absent.xml"), "missing")]:
+                with self.subTest(status=status):
+                    col = pd.Collector()
+                    pd.collect_ctest(col, SimpleNamespace(ctest_junit=str(path), junit=[]))
+                    self.assertEqual(col.components, [])
+                    self.assertEqual([(s["id"], s["status"]) for s in col.sources], [("ctest_junit", status)])
+
+
 class GpuLog(unittest.TestCase):
     LOG = "\n".join([
         "using runtime/build/RelWithDebInfo",
@@ -276,6 +304,11 @@ class GpuLog(unittest.TestCase):
 
 
 class Github(unittest.TestCase):
+    def test_default_repo_is_the_one_the_readme_clones(self):
+        # --github once read a repository that had gone private; the README is where the address is kept current
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+            self.assertIn(f"`git clone --recursive https://github.com/{pd.DEFAULT_REPO}`", f.read())
+
     def test_d3d_states(self):
         self.assertEqual(pd.d3d_state("@a", "#291 merged, #819, #831 on main", "")[0], "partial")
         self.assertEqual(pd.d3d_state("@a", "#1489 merged, #907 closed", "")[0], "implemented")
@@ -311,6 +344,8 @@ class Github(unittest.TestCase):
                 return merged if "merged" in args else open_prs
             if args[:2] == ["issue", "view"]:
                 return {"body": body, "updatedAt": "2026-11-22T00:00:00Z"}
+            if args[:2] == ["issue", "list"] and "D3D12" in args[args.index("--search") + 1]:
+                return [{"number": 313, "title": "D3D12 → Vulkan layer: critical path, who builds what"}]
             return []
         col = pd.Collector()
         with mock.patch.object(pd, "gh_json", fake_gh), mock.patch.object(pd.shutil, "which", lambda _: "/usr/bin/gh"):
@@ -325,11 +360,83 @@ class Github(unittest.TestCase):
                 return merged if "merged" in args else open_prs
             if args[:2] == ["issue", "view"]:
                 return {"body": body, "updatedAt": "2026-11-22T00:00:00Z"}
+            if args[:2] == ["issue", "list"] and "D3D12" in args[args.index("--search") + 1]:
+                return [{"number": 313, "title": "D3D12 → Vulkan layer: critical path, who builds what"}]
             return []
         col = pd.Collector()
         with mock.patch.object(pd, "gh_json", fake_gh), mock.patch.object(pd.shutil, "which", lambda _: "/usr/bin/gh"):
             pd.collect_github(col, "o/r", "me")
         return next(m for m in col.metrics if m["id"] == "d3d12.merged")
+
+    D3D_BODY = ("| ID | Title | Owner | PR | Status |\n|---|---|---|---|---|\n"
+                "| D3D-4 | b | @b | #60 merged | merged |\n| D3D-5 | c | @c | #61 | PR open |\n")
+
+    def run_d3d_lookup(self, issues, d3d_issue=None, readable=True):
+        """collect_github() with these open issues answering the D3D12 title search: the collector, the summary and
+        every gh call made."""
+        calls = []
+
+        def fake_gh(args, timeout=60):
+            calls.append(args)
+            if args[:2] == ["issue", "view"]:
+                return {"body": self.D3D_BODY, "updatedAt": "2026-11-22T00:00:00Z"} if readable else None
+            if args[:2] == ["issue", "list"] and "D3D12" in args[args.index("--search") + 1]:
+                return issues
+            return []
+        col = pd.Collector()
+        with mock.patch.object(pd, "gh_json", fake_gh), mock.patch.object(pd.shutil, "which", lambda _: "/usr/bin/gh"):
+            summary = pd.collect_github(col, "o/r", None, d3d_issue)
+        return col, summary, calls
+
+    @staticmethod
+    def viewed(calls):
+        return [a[2] for a in calls if a[:2] == ["issue", "view"]]
+
+    def test_d3d_issue_is_found_by_title_not_by_a_fixed_number(self):
+        # #313 was the tracking issue in the repository the project started in; here that number is something else
+        col, summary, calls = self.run_d3d_lookup([
+            {"number": 12, "title": "d3d12_vulkan_device: a crash in the Vulkan layer"},
+            {"number": 90, "title": "D3D12 -> Vulkan layer: critical path (continues the one below)"},
+            {"number": 41, "title": "D3D12 → Vulkan layer: critical path, who builds what, open methods"},
+        ])
+        self.assertEqual(self.viewed(calls), ["41"])                    # the oldest issue with the title; never "313"
+        self.assertEqual(summary["d3d_issue"], 41)
+        self.assertEqual(col.panels["d3d12"]["title"], "D3D12 → Vulkan layer items (#41)")
+        source = next(s for s in col.sources if s["id"] == "github_d3d12")
+        self.assertEqual((source["status"], source["records"]), ("ok", 2))
+        self.assertTrue(any(m["id"] == "d3d12.merged" for m in col.metrics))
+
+    def test_no_d3d_issue_is_reported_and_no_other_issue_is_read(self):
+        for issues in ([], None, [{"number": 313, "title": "tests: an unrelated pull request"}]):
+            with self.subTest(issues=issues):
+                col, summary, calls = self.run_d3d_lookup(issues)
+                self.assertEqual(self.viewed(calls), [])
+                self.assertNotIn("d3d_issue", summary)
+                source = next(s for s in col.sources if s["id"] == "github_d3d12")
+                self.assertEqual(source["status"], "missing")
+                self.assertIn("--d3d-issue", source["note"])
+                self.assertEqual(col.panels["d3d12"]["title"], "D3D12 → Vulkan layer items")
+                self.assertFalse(any(m["id"] == "d3d12.merged" for m in col.metrics))
+
+    def test_d3d_issue_option_names_the_issue(self):
+        col, summary, calls = self.run_d3d_lookup([{"number": 41, "title": "D3D12 → Vulkan layer: x"}], d3d_issue=7)
+        self.assertEqual(self.viewed(calls), ["7"])
+        self.assertFalse(any(a[:2] == ["issue", "list"] and "D3D12" in a[a.index("--search") + 1] for a in calls))
+        self.assertEqual(summary["d3d_issue"], 7)
+
+    def test_unreadable_d3d_issue_is_reported(self):
+        col, _, _ = self.run_d3d_lookup([], d3d_issue=7, readable=False)
+        source = next(s for s in col.sources if s["id"] == "github_d3d12")
+        self.assertEqual(source["status"], "invalid")
+        self.assertIn("#7", source["note"])
+
+    def test_d3d_issue_option_is_checked(self):
+        for argv in (["--out", "x", "--d3d-issue", "7"], ["--out", "x", "--github", "--d3d-issue", "0"]):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as stop:
+                    pd.main(argv)
+                self.assertEqual(stop.exception.code, 2)
+                self.assertIn("--d3d-issue", err.getvalue())
 
     @staticmethod
     def prs(*pairs):
@@ -439,6 +546,28 @@ class Scrub(unittest.TestCase):
 
 
 class Outputs(unittest.TestCase):
+    def test_login_without_github_is_an_argument_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            cmd = [sys.executable, "-I", TOOL, "--out", out, "--login", "fixture-reviewer"]
+            result = subprocess.run(cmd, capture_output=True, cwd=ROOT, timeout=120)
+            self.assertEqual(result.returncode, 2, result.stderr.decode("utf-8", "replace"))
+            self.assertIn(b"--login requires --github", result.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_nonpositive_test_options_are_argument_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            for option in ("--jobs", "--test-timeout"):
+                for value in ("0", "-1"):
+                    with self.subTest(option=option, value=value):
+                        cmd = [sys.executable, "-I", TOOL, "--out", out, "--run-tests",
+                               "--tests", "test_progress_dashboard", option, value]
+                        result = subprocess.run(cmd, capture_output=True, cwd=ROOT, timeout=120)
+                        self.assertEqual(result.returncode, 2, result.stderr.decode("utf-8", "replace"))
+                        self.assertIn(f"{option} must be a positive integer".encode("ascii"), result.stderr)
+                        self.assertFalse(os.path.exists(out))
+
     def test_invalid_test_filter_is_an_argument_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "out")
@@ -514,6 +643,17 @@ class Outputs(unittest.TestCase):
     def test_script_element_cannot_be_closed_by_data(self):
         snap = {"schema": pd.SCHEMA, "x": "</script><b>"}
         self.assertNotIn("</script><b>", pd.render_page(snap, []))
+
+    def test_out_as_existing_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            file_out = os.path.join(tmp, "not_a_dir")
+            with open(file_out, "wb") as f:
+                f.write(b"x")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = pd.main(["--out", file_out])
+            self.assertEqual(rc, 2)
+            self.assertIn("is not a directory", err.getvalue())
 
 
 if __name__ == "__main__":

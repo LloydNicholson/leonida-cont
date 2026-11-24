@@ -103,6 +103,12 @@ None of the programs is byte-identical to its source's FSSM code. Only 47 distin
 shaders compiled again with their pipeline's state. The 13 programs whose digest names no carved container (4 CS,
 5 PS, 3 VS, the slot-6 program) are the only ones with no source in the shader entries.
 
+For a VS or PS program without native wave-size metadata, a 32-bit EXEC operation and an agreeing wave32
+flag in every FSSM payload of its matching DXBC source distinguish a wave32 program that uses `s_bfm_b64`
+as scalar data. The translator keeps its existing behavior when the source is absent, the payloads disagree,
+or the library code has another strict wave64 marker. Synthetic cases are in
+`tests/semantic/test_fspx_wave_size.py`.
+
 ## 4. Tool
 
 ```sh
@@ -111,7 +117,10 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
 ```
 
 * It writes `fspx/<name>.code` and `fspx/<name>.json`, the layout `fspx_unpack.py` writes and `rdna2spirv.py`
-  reads (`native_blob`, `cs_dispatch_state`). It also writes `index.json` with each program's stage, and
+  reads (`native_blob`, `cs_dispatch_state`). A compute program also gets `fspx/<name>.state`, its record's state
+  blob (FSPX kind 0) as it is, whose SHA-256 is the index's `fspx_state_sha256`; in the 1.0.2.1 `shaders.rpf` library,
+  every compute program has one distinct state-blob index across `library.json`'s `compute` table (2,684 programs,
+  2,693 records). It also writes `index.json` with each program's stage, and
   `library.json` with the header and both pipeline tables, stage to program name. Programs are named
   `lib_<stage>_<index>`.
 * `--disasm` writes `disasm/<name>.s` for the code after the prologue, as `fspx_unpack.py --disasm` does.
@@ -123,7 +132,19 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
 
 The output is game data and must stay in your work folder. `tests/test_shader_library.py` builds libraries and
 archives by hand and covers the header, both tables, the size checks, the search in an archive and the digest
-walk. It also checks the `--carve` copy and the translator's reads of the compute sidecar.
+walk. It also checks the `--carve` copy, the translator's reads of the compute sidecar and the compute `.state`.
+
+**In the build.** `make_game.py`'s `shaders` stage runs this for the compute stage after the BVH step
+(`library_shaders`): `--stages cs --disasm --carve` into `<work>/shaders/library`, then `translate()` shards
+`rdna2spirv.py` across `--jobs` and merges into `<work>/shaders/spirv/library` with the stage's `--wave64-emulate`
+and fallback flags. The runtime's shader library
+reads that index next to `fspx/` and finds its entries by `fspx_code_sha256` and `fspx_state_sha256`
+([fspx.md](fspx.md), "Build and run-time lookup"). That is how the executable creates these pipelines: it reads the
+library through DirectStorage zlib requests and passes each compute record's four parts to Xbox device slot 67,
+`DeserializeComputePipelineStateX`, as kinds 0, 1, 6 and 7, so the code key is the program's bytes as the table gives
+them and the state key is the record's state blob. The step is redone as a whole when `shaders.rpf`, the tools,
+`llvm-mc`, the wave64 mode or the flags change (`library_build.json`, written last), and a clash of both keys between
+different modules fails it, as for the FSPX step. Graphics pipelines are not translated by the build.
 
 ### Slot-57 graphics cache
 

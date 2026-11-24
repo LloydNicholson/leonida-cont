@@ -17,7 +17,10 @@ stage, a table of state blobs and a table of native RDNA2 programs. Layout (docs
 A missing stage is program 0xFFFFFFFF. Stage slots: 0 pixel, 1 vertex, 2 mesh (6 is used once and not identified).
 A compute state blob has the 28-byte layout of an FSPX kind-0 entry (tools/fspx_unpack.py), and every program starts
 with the same 36-byte hash prologue as an FSPX program, so the programs are written in the layout fspx_unpack.py uses
-and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.json, index.json).
+and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.json, index.json). A compute program also gets its
+record's state blob as fspx/<name>.state, as fspx_unpack.py writes kind 0: the runtime finds a program the executable
+passes to Xbox device slot 67 by the SHA-256 of both (docs/fspx.md, "Build and run-time lookup"). In the 1.0.2.1
+library every compute program has exactly one state blob (2,684 programs, 2,693 records).
 
 Usage:
     python -I shader_library.py <shaders.rpf | library.bin> --out DIR [--stages cs,ps,vs,ms] [--disasm]
@@ -192,7 +195,7 @@ def stage_digest(y: bytes):
     return None
 
 
-def carve_digests(folder: str) -> dict:
+def carve_digests(folder: str, errors=None) -> dict:
     """digest -> [(shader name, container path)] over a tools/shader_carve.py output folder (its index.json and
     .dxbc files)."""
     import shader_carve
@@ -200,15 +203,24 @@ def carve_digests(folder: str) -> dict:
         index = json.load(f)
     out = {}
     for e in index:
+        path = os.path.join(folder, e["file"])
         try:
-            with open(os.path.join(folder, e["file"]), "rb") as f:
+            with open(path, "rb") as f:
                 c = f.read()
             parts = shader_carve.parts(c)
-        except (OSError, ValueError):
+            if c[:4] != b"DXBC":
+                raise ValueError("not a DXBC container")
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            msg = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+            print(f"carve: {e['file']}: {msg}", file=sys.stderr)
+            if errors is not None:
+                errors.append((e["file"], msg))
             continue
         if "HASH" in parts and parts["HASH"][1] >= 20:
             o = parts["HASH"][0]
-            out.setdefault(c[o + 4:o + 20], []).append((e["name"], os.path.join(folder, e["file"])))
+            out.setdefault(c[o + 4:o + 20], []).append((e["name"], path))
     return out
 
 
@@ -292,8 +304,10 @@ def main(argv=None) -> int:
         disasm = shader_disasm
         os.makedirs(os.path.join(a.out, "disasm"), exist_ok=True)
     names = {i: program_name(i, lib["stage"].get(i)) for i in range(lib["header"]["programs"])}
-    sources = carve_digests(a.carve) if a.carve else None
-    cs_state = {c["program"]: c["state"] for c in lib["compute"]}
+    carve_errors = []
+    sources = carve_digests(a.carve, errors=carve_errors) if a.carve else None
+    cs_state = {c["program"]: c["state"] for c in lib["compute"]
+                if c["program"] is not None and c["state"] is not None}
     index, written, work = [], 0, []
     for i in range(lib["header"]["programs"]):
         stages = lib["stage"].get(i, set())
@@ -304,8 +318,9 @@ def main(argv=None) -> int:
         start, end = code_range(code)
         meta = {"program": i, "stage": st, "offset": lib["programs"][i][0], "size": len(code),
                 "code": {"start": start, "end": end, "prologue": start == fspx_unpack.PROLOGUE_SIZE}}
-        if i in cs_state:
-            meta.update(fspx_unpack.decode_kind0(blob(b, lib, cs_state[i])))
+        state = blob(b, lib, cs_state[i]) if i in cs_state else None
+        if state is not None:
+            meta.update(fspx_unpack.decode_kind0(state))
         name = names[i]
         entry = {"file": name + ".dxbc", "stage": st, "program": i}
         digests = sorted(lib["digest"].get(i, ()))
@@ -325,6 +340,12 @@ def main(argv=None) -> int:
                 entry[k] = meta[k]
         with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
             f.write(code)
+        state_path = os.path.join(a.out, "fspx", name + ".state")
+        if state is not None:
+            with open(state_path, "wb") as f:   # kind 0 as it is: its SHA-256 is the index's fspx_state_sha256
+                f.write(state)
+        elif os.path.exists(state_path):
+            os.unlink(state_path)   # a program that lost its compute record must not keep an old state key
         with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump(meta, f, indent=1)
         if disasm and end:
@@ -366,7 +387,10 @@ def main(argv=None) -> int:
           f"{h['programs']} programs; {written} written to {a.out}")
     if sources is not None:
         linked = sum(1 for e in index if e["source"])
-        print(f"{linked} of {written} named by a carved shader's HASH digest, {written - linked} not in the carve")
+        extra = (f", {len(carve_errors)} unreadable/corrupt container"
+                 f"{'s' if len(carve_errors) != 1 else ''}") if carve_errors else ""
+        print(f"{linked} of {written} named by a carved shader's HASH digest, "
+              f"{written - linked} not in the carve{extra}")
     return 0
 
 

@@ -5,6 +5,7 @@
 Zero game data: every library and archive is built here from synthetic bytes.
 """
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -18,6 +19,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import shader_library as sl  # noqa: E402
+import shader_meta  # noqa: E402
 
 ENDPGM = struct.pack("<I", 0xBF810000)
 CODE_END = struct.pack("<I", 0xBF9F0000)
@@ -222,6 +224,16 @@ class Main(unittest.TestCase):
                 summary = json.load(f)
             self.assertEqual(summary["graphics"][1]["stages"], {"ps": "lib_ps_00000", "ms": "lib_ms_00002"})
             self.assertEqual(summary["compute"][0]["program"], "lib_cs_00003")
+            # The compute program gets its record's state blob as kind 0, which the run time finds a slot-67
+            # pipeline by (fspx_state_sha256); a graphics program gets none.
+            with open(os.path.join(out, "fspx", "lib_cs_00003.state"), "rb") as f:
+                self.assertEqual(f.read(), kind0())
+            self.assertFalse(os.path.exists(os.path.join(out, "fspx", "lib_vs_00001.state")))
+            disasm_file = os.path.join(out, "disasm", "lib_cs_00003.s")
+            self.assertEqual(shader_meta.fspx_state_sha256_file(disasm_file, "lib_cs_00003"),
+                             hashlib.sha256(kind0()).hexdigest())
+            self.assertEqual(shader_meta.fspx_code_sha256_file(disasm_file, "lib_cs_00003"),
+                             hashlib.sha256(sl.program(sample(), sl.parse(sample()), 3)).hexdigest())
 
     def test_stage_filter_and_saved_input(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,7 +244,46 @@ class Main(unittest.TestCase):
             rc, text = self.run_main(src, "--out", out, "--stages", "cs,vs")
             self.assertEqual(rc, 0)
             self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
-                             ["lib_cs_00003.code", "lib_cs_00003.json", "lib_vs_00001.code", "lib_vs_00001.json"])
+                             ["lib_cs_00003.code", "lib_cs_00003.json", "lib_cs_00003.state", "lib_vs_00001.code",
+                              "lib_vs_00001.json"])
+
+    def test_compute_missing_state_removes_stale_state_and_skips_none_blob(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            os.makedirs(os.path.join(out, "fspx"))
+            stale = os.path.join(out, "fspx", "lib_cs_00000.state")
+            with open(stale, "wb") as f:
+                f.write(b"stale state")
+            src = os.path.join(tmp, "lib.bin")
+            # Compute record with NONE state (0xFFFFFFFF) must not crash or keep a stale .state sidecar.
+            with open(src, "wb") as f:
+                f.write(build([], [(NONE, NONE, 0, NONE)], [], [prog(0x11112222)]))
+            rc, _ = self.run_main(src, "--out", out, "--stages", "cs")
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(stale))
+            disasm_file = os.path.join(out, "disasm", "lib_cs_00000.s")
+            self.assertIsNone(shader_meta.fspx_state_sha256_file(disasm_file, "lib_cs_00000"))
+            meta = shader_meta.collect(disasm_file, "lib_cs_00000", [[]], [[]])
+            self.assertIn("fspx_code_sha256", meta)
+            self.assertNotIn("fspx_state_sha256", meta)
+
+    def test_same_code_with_distinct_states_gets_distinct_state_keys(self):
+        code = prog(0x44556677)
+        s_a, s_b = kind0(threads=(32, 1, 1)), kind0(threads=(64, 1, 1))
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(build([], [(0, NONE, 0, NONE), (1, NONE, 1, NONE)], [s_a, s_b], [code, code]))
+            out = os.path.join(tmp, "out")
+            rc, _ = self.run_main(src, "--out", out, "--stages", "cs")
+            self.assertEqual(rc, 0)
+            metas = [
+                shader_meta.collect(os.path.join(out, "disasm", f"lib_cs_{i:05d}.s"), f"lib_cs_{i:05d}", [[]], [[]])
+                for i in range(2)
+            ]
+            self.assertEqual({m["fspx_code_sha256"] for m in metas}, {hashlib.sha256(code).hexdigest()})
+            self.assertEqual([m["fspx_state_sha256"] for m in metas],
+                             [hashlib.sha256(s_a).hexdigest(), hashlib.sha256(s_b).hexdigest()])
 
     def test_carve_names_sources_and_copies_containers(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -296,6 +347,99 @@ class Main(unittest.TestCase):
                     rdna2spirv.translate(s_path)
             finally:
                 rdna2spirv._STAGES = None
+
+    def test_carve_reports_corrupt_and_unreadable_containers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            with open(os.path.join(carve, "PS_A.dxbc"), "wb") as f:
+                f.write(dxbc(D_PS))
+            with open(os.path.join(carve, "VS_C.dxbc"), "wb") as f:
+                f.write(dxbc(D_VS)[:20])                             # truncated header
+            with open(os.path.join(carve, "MS_D.dxbc"), "wb") as f:
+                f.write(dxbc(D_MS)[:-4])                             # truncated part payload
+            os.makedirs(os.path.join(carve, "CS_B.dxbc"))            # exists on disk, unreadable OSError
+            index = [
+                {"name": "PS_A", "file": "PS_A.dxbc"},
+                {"name": "gone", "file": "gone.dxbc"},               # missing: skipped silently
+                {"name": "VS_C", "file": "VS_C.dxbc"},
+                {"name": "MS_D", "file": "MS_D.dxbc"},
+                {"name": "CS_B", "file": "CS_B.dxbc"},
+            ]
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(index, f)
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            out = os.path.join(tmp, "out")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = sl.main([src, "--out", out, "--carve", carve])
+            self.assertEqual(rc, 0)
+            self.assertIn("1 of 4 named by a carved shader's HASH digest, 3 not in the carve, "
+                          "3 unreadable/corrupt containers", stdout.getvalue())
+            err_lines = stderr.getvalue().splitlines()
+            self.assertEqual(len(err_lines), 3)
+            self.assertEqual(err_lines[0], "carve: VS_C.dxbc: truncated DXBC header")
+            self.assertEqual(err_lines[1], "carve: MS_D.dxbc: truncated DXBC part payload")
+            self.assertTrue(err_lines[2].startswith("carve: CS_B.dxbc: ") and len(err_lines[2]) > len("carve: CS_B.dxbc: "))
+            self.assertNotIn("gone.dxbc", stderr.getvalue())
+            self.assertTrue(os.path.isfile(os.path.join(out, "lib_ps_00000.dxbc")))
+
+    def test_carve_missing_only_stays_silent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            with open(os.path.join(carve, "PS_A.dxbc"), "wb") as f:
+                f.write(dxbc(D_PS))
+            index = [
+                {"name": "PS_A", "file": "PS_A.dxbc"},
+                {"name": "gone", "file": "gone.dxbc"},
+            ]
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(index, f)
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            out = os.path.join(tmp, "out")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = sl.main([src, "--out", out, "--carve", carve])
+            self.assertEqual(rc, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertIn("1 of 4 named by a carved shader's HASH digest, 3 not in the carve\n", stdout.getvalue())
+            self.assertNotIn("unreadable/corrupt", stdout.getvalue())
+
+    def test_carve_single_corrupt_container_and_direct_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            with open(os.path.join(carve, "PS_A.dxbc"), "wb") as f:
+                f.write(dxbc(D_PS))
+            with open(os.path.join(carve, "ZERO.dxbc"), "wb") as f:
+                f.write(bytes(64))                                   # valid length/count=0, wrong magic
+            index = [
+                {"name": "PS_A", "file": "PS_A.dxbc"},
+                {"name": "ZERO", "file": "ZERO.dxbc"},
+            ]
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(index, f)
+            direct_err = io.StringIO()
+            with contextlib.redirect_stderr(direct_err):
+                digests = sl.carve_digests(carve)
+            self.assertEqual(digests, {D_PS: [("PS_A", os.path.join(carve, "PS_A.dxbc"))]})
+            self.assertEqual(direct_err.getvalue().splitlines(), ["carve: ZERO.dxbc: not a DXBC container"])
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            out = os.path.join(tmp, "out")
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = sl.main([src, "--out", out, "--carve", carve])
+            self.assertEqual(rc, 0)
+            self.assertIn("1 of 4 named by a carved shader's HASH digest, 3 not in the carve, "
+                          "1 unreadable/corrupt container\n", stdout.getvalue())
+            self.assertEqual(stderr.getvalue().splitlines(), ["carve: ZERO.dxbc: not a DXBC container"])
 
 
 if __name__ == "__main__":

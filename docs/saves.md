@@ -41,6 +41,11 @@ body  UTF-8 JSON, CRLF between blocks:
 Both samples have 38 code and 44 script blocks. `tools/saves.py verify` rebuilds them byte for byte from the parsed
 blocks, which confirms the framing, padding and offsets. The JSAV carries no checksum of its own.
 
+A body or a block nested deeper than 512 JSON levels is rejected as malformed (`JSON_NESTING_LIMIT` in
+`tools/saves.py`, one error line and exit 2). The limit is the tool's, not the interpreter's: Python 3.14's JSON
+decoder is iterative and no longer raises `RecursionError` on a deeply nested document, while real saves nest a few
+levels.
+
 Block conventions:
 - Each block is `{"$0x<group>":{"$0x<hash>":{...}}}`, with one group hash for code blocks and one for script blocks. The inner hash equals the index entry's hash. **confirmed**
 - Keys are 32-bit hashes written as `"$0x%08x"`: the **case-sensitive** joaat (seed 0, no lower-casing) of the engine or script name, the same rule as the member hashes in [world_names.md](world_names.md). **confirmed**, see [Key names](#key-names).

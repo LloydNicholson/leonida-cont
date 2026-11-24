@@ -138,6 +138,7 @@ _ALWAYS_BARRIER_OPS = frozenset({
     "s_barrier", "v_readlane_b32", "v_readfirstlane_b32",
     "v_permlane16_b32", "v_permlanex16_b32",
     "ds_bpermute_b32", "ds_permute_b32", "ds_swizzle_b32",
+    "ds_append", "ds_consume",
     "s_wqm_b32", "s_wqm_b64",
 })
 
@@ -747,8 +748,19 @@ def _holds_lane_mask(ins, x, lm_map):
         t = x.get("t", "")
         return t.startswith("exec") or (t.startswith("vcc") and "vcc" in lm_map)
     if k == "sgpr":
-        return all(x["r"] + i in lm_map for i in range(x.get("n", 1)))
+        n = x.get("n", 1)
+        if n == 2:
+            # Gen.holds_lane_mask takes a pair as a mask when one word is a mask and the other a constant 0 / -1
+            # (s_mov_b32 s5, 0 after a v_cmp into s[4:5]). `lm_map` has no constants, so one mask word is enough
+            # here; a pair with a data word too is then over-approximated, which only costs a fold (old #4480).
+            return x["r"] in lm_map or x["r"] + 1 in lm_map
+        return all(x["r"] + i in lm_map for i in range(n))
     return False
+
+
+def _has_any_lane_mask_word(x, lm_map):
+    """True if `x` is an SGPR operand with at least one register holding a lane mask."""
+    return x.get("k") == "sgpr" and any(x["r"] + i in lm_map for i in range(x.get("n", 1)))
 
 
 def _is_mask_op(ins, x, lm_map):
@@ -862,7 +874,9 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
                     return False, _EMPTY_MEM_STATS, 0, (), ()
             else:  # _MASK_CHK_SCMP
                 lm = lane_masks.get(id(ins), {})
-                if any(_holds_lane_mask(ins, x, lm) for x in a):
+                if any(_holds_lane_mask(ins, x, lm) or
+                       (m[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
+                       for x in a):
                     return False, _EMPTY_MEM_STATS, 0, (), ()
 
         # 3. Track scalar writes and EXEC writes.
@@ -1231,7 +1245,9 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                         continue
                 else:  # _MASK_CHK_SCMP
                     lm = lane_masks.get(id(ins), {})
-                    if any(_holds_lane_mask(ins, x, lm) for x in a):
+                    if any(_holds_lane_mask(ins, x, lm) or
+                           (m[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
+                           for x in a):
                         clean = False
                         continue
 
@@ -1465,7 +1481,9 @@ def _insn_may_barrier_with_meta(ins, meta, lane_masks, scc_live):
     if mask_chk == _MASK_CHK_MBCNT:
         return len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lane_masks.get(id(ins), {}))
     lm = lane_masks.get(id(ins), {})
-    return any(_holds_lane_mask(ins, x, lm) for x in a)
+    return any(_holds_lane_mask(ins, x, lm) or
+               (meta[0] in ("s_cmp_eq_u64", "s_cmp_lg_u64") and _has_any_lane_mask_word(x, lm))
+               for x in a)
 
 
 def _insn_may_barrier(ins, lane_masks, scc_live):

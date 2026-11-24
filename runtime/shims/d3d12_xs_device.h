@@ -193,6 +193,24 @@ ID3D12Device* device_proxy_real_device(const void* device);
 using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc,
                                       std::uint32_t layout, REFIID riid, void** out);
 void set_placed_at_va_handler(PlacedAtVaHandler handler);
+
+// Called by slot 133 for a buffer, before the handler, with the buffer's range [va, va + width). gta6rt registers
+// rt::xmem::commit_physical_range: xmem commits physical pages on first touch, so a range the title has mapped but
+// not written yet is still reserved, and the handler's import refuses reserved pages (it would answer with its
+// fallback buffer, which the title's writes never reach). A false return is logged once and the handler is still
+// called. With none registered nothing is done.
+using PlacedAtVaPagesHook = bool (*)(const void* va, std::size_t bytes);
+void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook);
+
+// NOT USED on this branch: slot 14 goes through the XMem allocation hooks (#7021) here; the setter only stores it.
+// Device slot 14's console-extended CreateDescriptorHeap: the description is the PC 16-byte shape followed by a
+// console VA and a size (issue #313). The proxy does not create the heap itself: the device behind it registers this
+// handler, which the Vulkan layer implements (rt::d3d12::create_console_descriptor_heap). With none registered, or a
+// 16-byte PC description (address 0), the slot uses the PC CreateDescriptorHeap.
+using ConsoleDescriptorHeapHandler = HRESULT (*)(ID3D12Device* real, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+                                                D3D12_GPU_VIRTUAL_ADDRESS console_address, std::uint64_t console_size,
+                                                REFIID riid, void** out);
+void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler);
 std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* device);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue

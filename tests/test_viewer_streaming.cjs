@@ -407,11 +407,17 @@ test('Shift speeds the camera up and Ctrl slows it down, on either side of the k
             Color: class {}, Fog: class {}, HemisphereLight: class {}, MeshStandardMaterial: class {}, Euler: class {},
             Group: class { add() {} },
             Vector3,
+            MathUtils: { clamp: (v, low, high) => Math.min(high, Math.max(low, v)) },
         },
         document: { body: { prepend() {} }, getElementById: () => ({}), addEventListener() {} },
         addEventListener: (type, handler) => handlers.set(type, handler),
         devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location: { search: '' },
         performance: { now: () => 0 },
+        // viewer/index.html starts loadWorld() at module scope, which creates an AbortController and arms a
+        // timeout; a vm context only has what the sandbox gives it, so the browser globals it needs are here:
+        // the timers never fire, the manifest has no chunks to stream.
+        AbortController,
+        setTimeout: () => 1, clearTimeout() {},
         fetch: manifestResponse({ spawn: [0, 0, 0], chunks: [] }), GLTFLoader: class {},
     });
     // One frame is 0.1 s at the default 40 m/s, so E alone climbs 4 m.
@@ -428,6 +434,20 @@ test('Shift speeds the camera up and Ctrl slows it down, on either side of the k
     close(climb('ShiftRight'), 20);
     close(climb('ControlLeft'), 0.8);
     close(climb('ControlRight'), 0.8);
+    // A wheel changes the speed by 1.15 per notch; a sideways scroll (a trackpad pan, deltaX only) must not.
+    // A wheel changes the speed by 1.15 per notch; a sideways scroll (a trackpad pan, deltaX only) must not.
+    const wheel = handlers.get('wheel');
+    close(climb(), 4);
+    wheel({ deltaX: 120, deltaY: 0 });
+    close(climb(), 4);
+    wheel({ deltaX: -120, deltaY: 0 });
+    close(climb(), 4);
+    wheel({ deltaX: 120, deltaY: 10 });
+    close(climb(), 4);
+    wheel({ deltaX: 0, deltaY: -100 });
+    close(climb(), 4.6);
+    wheel({ deltaX: 0, deltaY: 100 });
+    close(climb(), 4);
 });
 
 const begin = html.indexOf('// ---------- chunk streaming ----------');

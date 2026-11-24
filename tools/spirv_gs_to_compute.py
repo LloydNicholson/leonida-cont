@@ -6,15 +6,16 @@ writes the vertices it emits into a buffer, followed by an ordinary draw of that
 by tools/rdna2spirv.py (stage `Geometry`) into a GLCompute module with one invocation per input primitive:
 
 - the per-vertex inputs (`BuiltIn Position`, `Location N`: Input arrays of vec4) are read from the input buffer
-  (set 1, binding 0), `{ uint primitive_count; uint pad[3]; vec4 data[]; }`: vertex v of primitive p has its
-  inputs at `data[(p * VERTS_IN + v) * NUM_INPUTS + slot]`;
+  (set 1, binding `base_binding + 0`), `{ uint primitive_count; uint pad[3]; vec4 data[]; }`: vertex v of primitive p
+  has its inputs at `data[(p * VERTS_IN + v) * NUM_INPUTS + slot]`;
 - the vec4 outputs become private variables, and every `OpEmitVertex` copies them to the record buffer
-  (set 1, binding 1), `{ vec4 rec[]; }`: vertex n of primitive p at `rec[(p * MAX_VERTS + n) * NUM_OUTPUTS + slot]`;
-- the meta buffer (set 1, binding 2), `{ uint meta[]; }`, gets `meta[p * (MAX_VERTS + 1)]` = the vertices
-  primitive p emitted and `meta[p * (MAX_VERTS + 1) + 1 + n]` = 1 when `OpEndPrimitive` ends a strip after vertex n
-  (0 otherwise).
+  (set 1, binding `base_binding + 1`), `{ vec4 rec[]; }`: vertex n of primitive p at `rec[(p * MAX_VERTS + n) * NUM_OUTPUTS + slot]`;
+- the meta buffer (set 1, binding `base_binding + 2`), `{ uint meta[]; }`, gets `meta[p * (MAX_VERTS + 1)]` = the
+  vertices primitive p emitted and `meta[p * (MAX_VERTS + 1) + 1 + n]` = 1 when `OpEndPrimitive` ends a strip after
+  vertex n (0 otherwise).
 
-Slots are ordered Position first, then by location; `--layout` writes them with the sizes. `PrimitiveId` reads give
+`base_binding` defaults to 0 and shifts past any existing descriptor set 1 bindings in the module (such as
+`--pc-tail-ubo` at binding 0); `--layout` records `base_binding` and the slots with their sizes. `PrimitiveId` reads give
 p, `InvocationId` reads 0 (only `Invocations 1` is supported). The workgroup is 64x1x1; invocations past
 `primitive_count` return at once. Push constants and set 0 are untouched. The draw afterwards turns each strip into
 triangles (or lines, points) in emission order.
@@ -22,6 +23,7 @@ triangles (or lines, points) in emission order.
 Usage: spirv_gs_to_compute.py in.spv out.spv [--layout out.json]
 Needs spirv-dis and spirv-as (SPIRV-Tools) on PATH, or SPIRV_DIS / SPIRV_AS.
 """
+import io
 import json
 import os
 import re
@@ -43,10 +45,15 @@ class Unsupported(Exception):
     pass
 
 
+def _assembly_lines(text):
+    # Only physical line endings separate instructions; Unicode separators can be part of a quoted name.
+    return (line.removesuffix("\n") for line in io.StringIO(text, newline=None))
+
+
 def parse(text):
     """defs: id -> (opcode, operands) for '%id = OpX ...' lines; deco: id -> its OpDecorate operand strings."""
     defs, deco = {}, {}
-    for ln in text.splitlines():
+    for ln in _assembly_lines(text):
         m = re.match(r"\s*(%\w+) = (Op\w+)(.*)$", ln)
         if m:
             defs[m.group(1)] = (m.group(2), m.group(3).split())
@@ -117,7 +124,7 @@ def layout_of(text):
 def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[str, int | str | list[str]]]:
     """Return (compute module text, layout dict for --layout)."""
     lay = layout_of(text)
-    defs, _ = parse(text)
+    defs, deco = parse(text)
     main, ins, outs, builtins = lay["main"], lay["input_vars"], lay["output_vars"], lay["builtins"]
     uint = find_type(defs, "OpTypeInt", ["32", "0"])
     f32 = find_type(defs, "OpTypeFloat", ["32"])
@@ -128,6 +135,17 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
     boolt = find_type(defs, "OpTypeBool", []) or "%gsc_bool"
     float_ptrs = {r for r, (op, ops) in defs.items() if op == "OpTypePointer" and ops[1] == f32}
     nin, nout, mv, vin = len(ins), len(outs), lay["max_verts"], lay["verts_in"]
+    # A GS translated with --pc-tail-ubo that reads the heap base or code base already binds %pc_tail as a Uniform
+    # block at (DescriptorSet 1, Binding 0); shift the capture StorageBuffers past any existing Set 1 bindings so
+    # two variables of different descriptor types never share (set, binding) (VUID-07990).
+    set1_bindings = {
+        int(b.split()[1])
+        for ds in deco.values()
+        if "DescriptorSet 1" in ds
+        for b in ds
+        if b.startswith("Binding ") and len(b.split()) == 2 and b.split()[1].isdigit()
+    }
+    base_binding = (max(set1_bindings) + 1) if set1_bindings else 0
 
     def k(v):
         return f"%gsc_k{v}"
@@ -141,9 +159,10 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
              "OpMemberDecorate %gsc_in_t 1 Offset 4", "OpMemberDecorate %gsc_in_t 2 Offset 16",
              f"OpDecorate %gsc_rec_t {buffer_block}", "OpMemberDecorate %gsc_rec_t 0 Offset 0",
              f"OpDecorate %gsc_meta_t {buffer_block}", "OpMemberDecorate %gsc_meta_t 0 Offset 0",
-             "OpDecorate %gsc_in DescriptorSet 1", "OpDecorate %gsc_in Binding 0", "OpDecorate %gsc_in NonWritable",
-             "OpDecorate %gsc_rec DescriptorSet 1", "OpDecorate %gsc_rec Binding 1",
-             "OpDecorate %gsc_meta DescriptorSet 1", "OpDecorate %gsc_meta Binding 2"]
+             "OpDecorate %gsc_in DescriptorSet 1", f"OpDecorate %gsc_in Binding {base_binding}",
+             "OpDecorate %gsc_in NonWritable",
+             "OpDecorate %gsc_rec DescriptorSet 1", f"OpDecorate %gsc_rec Binding {base_binding + 1}",
+             "OpDecorate %gsc_meta DescriptorSet 1", f"OpDecorate %gsc_meta Binding {base_binding + 2}"]
     types = ([f"{v3u} = OpTypeVector {uint} 3"] if v3u == "%gsc_v3u" else []) + \
             ([f"{boolt} = OpTypeBool"] if boolt == "%gsc_bool" else [])
     types += [f"{k(v)} = OpConstant {uint} {v}" for v in sorted({0, 1, 2, 3, vin, nin, nout, mv, mv + 1}
@@ -187,9 +206,10 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
     cur_block = None
     emit_split = set()
     block_tail = {}
+    derived = {}            # pointer id from an input or output -> the storage class it has now ("sb" or "pv")
     main_start = None
     state = "header"        # header -> main_entry -> main_vars -> main -> other
-    for ln in text.splitlines():
+    for ln in _assembly_lines(text):
         s = ln.strip()
         if s == "OpCapability Geometry":
             continue
@@ -283,10 +303,24 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             out += [f"{a} = OpIAdd {uint} %gsc_inbase {vtx}", f"{b} = OpIMul {uint} {a} {k(nin)}",
                     f"{c} = OpIAdd {uint} {b} {k(in_slot[m.group(3)])}",
                     " ".join([f"{m.group(1)} = OpAccessChain {ptr} %gsc_in {k(2)} {c}"] + idx[1:])]
+            derived[m.group(1)] = "sb"
             continue
         if m and m.group(3) in out_vars:
             ptr = "%gsc_ptr_pv_f" if m.group(2) in float_ptrs else "%gsc_ptr_pv_v4"
             out.append(f"{m.group(1)} = OpAccessChain {ptr} {out_vars[m.group(3)]} {m.group(4)}")
+            derived[m.group(1)] = "pv"
+            continue
+        # A pointer made from one of those (a further access chain, or a copy) points into the same buffer or
+        # private variable, so its result type takes that storage class too, not the old Input / Output (old #4126).
+        m = re.match(r"(%\w+) = (Op(?:InBounds)?(?:Ptr)?AccessChain|OpCopyObject) (%\w+) (%\w+)(.*)$", s)
+        if m and m.group(4) in derived:
+            pointee = defs.get(m.group(3), (None, []))[1][1:2]
+            if pointee not in ([v4], [f32]):
+                raise Unsupported(f"pointer into a geometry input or output of an unhandled type: {s}")
+            sc = derived[m.group(4)]
+            ptr = f"%gsc_ptr_{sc}_{'v4' if pointee == [v4] else 'f'}"
+            out.append(f"{m.group(1)} = {m.group(2)} {ptr} {m.group(4)}{m.group(5)}")
+            derived[m.group(1)] = sc
             continue
         m = re.match(r"(%\w+) = OpLoad (%\w+) (%\w+)(?:\s+.*)?$", s)
         if m and builtins.get(m.group(3)) in ("PrimitiveId", "InvocationId"):
@@ -349,6 +383,8 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
         out.append(s)
     public = {key: lay[key] for key in ("verts_in", "max_verts", "topology", "inputs", "outputs")}
     public["local_size"] = LOCAL_SIZE
+    if base_binding:
+        public["base_binding"] = base_binding
     return "\n".join(out) + "\n", public
 
 

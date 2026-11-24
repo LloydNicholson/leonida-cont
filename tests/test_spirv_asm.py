@@ -40,6 +40,90 @@ def _validate(spv: bytes, target_env: str = "vulkan1.2") -> None:
 
 
 class SpirvAsmUnitTests(unittest.TestCase):
+    def test_unicode_separators_remain_in_literal_strings(self):
+        literal = "first\u0085second\u2028third\u2029last"
+        expected = literal.encode("utf-8") + b"\x00"
+        expected += b"\x00" * (-len(expected) % 4)
+        for newline in ("\n", "\r\n", "\r"):
+            with self.subTest(newline=newline):
+                asm = f'%str = OpString "{literal}"{newline}OpNop{newline}'
+                spv = spirv_asm.assemble(asm)
+                words = _literal_words(spv, 7, 1)  # OpString result ID precedes its literal.
+                self.assertEqual(struct.pack(f"<{len(words)}I", *words), expected)
+
+    def test_literal_line_endings_preserve_bytes(self):
+        comment = '; An unmatched " in this comment is ordinary text.'
+        for ending in ("\r", "\r\n", "\n"):
+            with self.subTest(literal_ending=ending):
+                operand = f'first \\"; middle{ending}last'
+                expected = f'first "; middle{ending}last'.encode("utf-8")
+                asm = f'{comment}\r\n%str = OpString "{operand}"\r\nOpNop\r\n'
+                words = _literal_words(spirv_asm.assemble(asm), 7, 1)
+                self.assertEqual(struct.pack(f"<{len(words)}I", *words).split(b"\0", 1)[0], expected)
+
+    def test_error_line_after_multiline_literal_is_physical_line(self):
+        asm = '; comment\r\n%str = OpString "first\rsecond\r\nthird\nlast"\r\nOpNotReal\n'
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 6: unknown opcode"):
+            spirv_asm.assemble(asm)
+
+    def test_cli_preserves_literal_crlf_in_source_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            src = os.path.join(directory, "literal.spvasm")
+            dst = os.path.join(directory, "literal.spv")
+            literal = b"first\r\nsecond"
+            with open(src, "wb") as f:
+                f.write(b'%str = OpString "' + literal + b'"\nOpNop\n')
+            result = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"), src, "-o", dst],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(dst, "rb") as f:
+                words = _literal_words(f.read(), 7, 1)
+            self.assertEqual(struct.pack(f"<{len(words)}I", *words).split(b"\0", 1)[0], literal)
+
+    def test_instruction_boundaries_follow_tokens_across_physical_lines(self):
+        canonical = (
+            "OpCapability Shader\n"
+            "OpMemoryModel Logical GLSL450\n"
+            'OpEntryPoint GLCompute %main "main"\n'
+            "OpExecutionMode %main LocalSize 1 1 1\n"
+            '%file = OpString "OpNop ; = %id"\n'
+            "%int = OpTypeInt 32 1\n"
+            "%pair = OpTypeStruct %int %int\n"
+            "%void = OpTypeVoid\n"
+            "%fn = OpTypeFunction %void\n"
+            "%main = OpFunction %void None %fn\n"
+            "%entry = OpLabel\n"
+            "OpNop\nOpReturn\nOpFunctionEnd\n"
+        )
+        mixed = (
+            "OpCapability Shader OpMemoryModel\r\nLogical GLSL450\n"
+            'OpEntryPoint GLCompute %main "main" OpExecutionMode %main LocalSize 1 1 1\n'
+            '%file = OpString "OpNop ; = %id" %int\r=\nOpTypeInt 32 ; signedness follows\n1 '
+            "%pair = OpTypeStruct %int\n%int\n"
+            "%void = OpTypeVoid %fn = OpTypeFunction %void\n"
+            "%main = OpFunction %void None\n%fn %entry = OpLabel\n"
+            "OpNop OpReturn OpFunctionEnd\n"
+        )
+        assembled = spirv_asm.assemble(mixed)
+        self.assertEqual(assembled, spirv_asm.assemble(canonical))
+        _validate(assembled)
+
+    def test_prefixed_specialization_mnemonic_can_start_a_physical_line(self):
+        prefix = "%int = OpTypeInt 32 1\n%one = OpSpecConstant %int 1\n"
+        canonical = prefix + "%two = OpSpecConstantOp %int IAdd %one %one\nOpNop\n"
+        wrapped = prefix + "%two = OpSpecConstantOp %int\nOpIAdd %one\n%one OpNop\n"
+        self.assertEqual(spirv_asm.assemble(wrapped), spirv_asm.assemble(canonical))
+
+    def test_result_id_starts_instruction_on_its_physical_line(self):
+        text = '%str = OpString "first\r\nlast" %x\r=\nOpNotReal\n'
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 2: unknown opcode"):
+            spirv_asm.assemble(text)
+
+    def test_later_unterminated_literal_reports_its_physical_line(self):
+        text = '%str = OpString "first\rlast" %bad = OpString "unterminated'
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 2: unterminated string"):
+            spirv_asm.assemble(text)
+
     def test_reject_repeated_type_result_ids(self):
         declarations = (
             ("OpTypeInt 32 0", "OpTypeFloat 32"),
@@ -100,6 +184,7 @@ class SpirvAsmUnitTests(unittest.TestCase):
         for env, expected_ver in (
             ("vulkan1.0", 0x00010000),
             ("vulkan1.1", 0x00010300),
+            ("vulkan1.1spv1.4", 0x00010400),
             ("vulkan1.2", 0x00010500),
             ("vulkan1.3", 0x00010600),
         ):
@@ -621,6 +706,110 @@ class SelectorMustBeDefinedBeforeTests(unittest.TestCase):
                 "%sel = OpLoad %ulong %v\nOpSelectionMerge %x None\nOpSwitch %sel %x 0x100000001 %x\n"
                 "%x = OpLabel\nOpReturn\nOpFunctionEnd\n")
         self.assertEqual(len(_switch_instruction(spirv_asm.assemble(load))), 6)
+
+
+_FLOAT_HEAD = (
+    "OpCapability Shader\nOpCapability Float16\nOpCapability Float64\nOpMemoryModel Logical GLSL450\n"
+    "%f16 = OpTypeFloat 16\n%f32 = OpTypeFloat 32\n%f64 = OpTypeFloat 64\n"
+)
+
+
+def _float_constant(type_name: str, literal: str) -> list[int]:
+    """The literal words of `%c = OpConstant %<type_name> <literal>` as spirv_asm encodes them."""
+    spv = spirv_asm.assemble(_FLOAT_HEAD + f"%c = OpConstant %{type_name} {literal}\n")
+    return _literal_words(spv, 43, 2)
+
+
+class FloatLiteralTests(unittest.TestCase):
+    """Float constant bits as SPIRV-Tools' HexFloat parser (source/util/hex_float.h) gives them."""
+
+    def _check(self, cases):
+        for type_name, literal, expected in cases:
+            with self.subTest(type=type_name, literal=literal):
+                self.assertEqual(_float_constant(type_name, literal), expected)
+
+    def test_hex_float_digits_that_do_not_fit_are_truncated_toward_zero(self):
+        # old #4330 (@mrbean56): rounding to nearest gave the next value up for each of these.
+        self._check((
+            ("f32", "0x1.0000018p0", [0x3F800000]), ("f32", "-0x1.0000018p0", [0xBF800000]),
+            ("f32", "0x1.fffffffp127", [0x7F7FFFFF]), ("f32", "0x1.8p-149", [0x00000001]),
+            ("f32", "0x1.8p-150", [0x00000000]), ("f32", "-0x1p-150", [0x80000000]),
+            ("f32", "0x1.8p+0", [0x3FC00000]), ("f32", "0x1p+128", [0x7F800000]), ("f32", "0x1p+129", [0x7F800000]),
+            ("f16", "0x1.003p0", [0x3C00]), ("f16", "0x1.ffep15", [0x7BFF]), ("f16", "0x1.8p-24", [0x0001]),
+            ("f64", "0x1.0000000000000cp0", [0x00000000, 0x3FF00000]),
+            ("f64", "0x1.fffffffffffff8p1023", [0xFFFFFFFF, 0x7FEFFFFF]),
+        ))
+
+    def test_decimal_is_rounded_once_to_f32_and_f16_narrows_that_toward_zero(self):
+        # old #3911 (@lumenpearson): each of these decimals reads as a double on an f32 tie, which rounding the double
+        # again broke the wrong way; strtof rounds the decimal once. A 16-bit decimal is that f32 cut toward zero.
+        self._check((
+            ("f32", "1.00000005960464477539062500000001", [0x3F800001]),
+            ("f32", "-1.00000005960464477539062500000001", [0xBF800001]),
+            ("f32", "1.000000059604644775390625", [0x3F800000]),
+            ("f32", "1.00000017881393432617187499999999", [0x3F800001]),
+            ("f32", "1.000000178813934326171875", [0x3F800002]),
+            ("f32", "7.00649232162408535461864791644958065640130970938257885878534141944895541342930300743319094181060791"
+                    "015625000001e-46", [0x00000001]),
+            ("f32", "0.1", [0x3DCCCCCD]), ("f32", "3.4028235e38", [0x7F7FFFFF]), ("f32", "-0.0", [0x80000000]),
+            ("f16", "1.0006", [0x3C00]), ("f16", "-1.0006", [0xBC00]), ("f16", "65535", [0x7BFF]),
+            ("f16", "5e-8", [0x0000]), ("f16", "0.1", [0x2E66]), ("f16", "1.5", [0x3E00]),
+            ("f64", "0.1", [0x9999999A, 0x3FB99999]),
+        ))
+
+    def test_decimal_that_overflows_or_is_not_finite_is_refused(self):
+        # old #4286: these were emitted as infinities (or NaN); spirv-as refuses each one.
+        for type_name, literal in (
+            ("f64", "1e400"), ("f64", "-1e400"), ("f64", "1.8e308"), ("f32", "1e39"), ("f32", "-3.4028236e38"),
+            ("f16", "65536"), ("f16", "1e5"), ("f32", "inf"), ("f32", "-inf"), ("f64", "nan"),
+            ("f64", "infinity"), ("f32", "1_0"),
+        ):
+            with self.subTest(type=type_name, literal=literal):
+                with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 8: .*float literal"):
+                    _float_constant(type_name, literal)
+        # Underflow is not an error: the value rounds to zero, as strtod gives it.
+        self._check((
+            ("f64", "1.7976931348623157e308", [0xFFFFFFFF, 0x7FEFFFFF]), ("f64", "-1e-400", [0x00000000, 0x80000000]),
+            ("f32", "3.4028235e38", [0x7F7FFFFF]), ("f32", "1e-50", [0x00000000]), ("f16", "65504", [0x7BFF]),
+            ("f32", "1.", [0x3F800000]), ("f32", ".5", [0x3F000000]), ("f32", "+2E1", [0x41A00000]),
+        ))
+
+    def test_bfloat16_constant_is_the_top_half_of_an_f32(self):
+        # old #4237: OpTypeFloat 16 BFloat16KHR constants were encoded as IEEE halves (1.5 was 0x3E00).
+        head = _FLOAT_HEAD + "%bf = OpTypeFloat 16 BFloat16KHR\n%bf0 = OpTypeFloat 16 0\n"
+        for type_name, literal, expected in (
+            ("bf", "1.5", [0x3FC0]), ("bf", "-2", [0xC000]), ("bf", "0.1", [0x3DCC]), ("bf", "1.0078125", [0x3F81]),
+            ("bf", "1.00390625", [0x3F80]), ("bf", "3.4e38", [0x7F7F]), ("bf", "0x1.fep0", [0x3FFF]),
+            ("bf", "0x1.ffp0", [0x3FFF]), ("bf", "-0x1p+128", [0xFF80]), ("bf", "0x1.8p+128", [0x7FC0]),
+            ("bf0", "1.5", [0x3FC0]), ("f16", "1.5", [0x3E00]),
+        ):
+            with self.subTest(type=type_name, literal=literal):
+                spv = spirv_asm.assemble(head + f"%c = OpConstant %{type_name} {literal}\n")
+                self.assertEqual(_literal_words(spv, 43, 2), expected)
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 10: .* 1e39 is out of range for a bfloat16"):
+            spirv_asm.assemble(head + "%c = OpConstant %bf 1e39\n")
+
+
+class DebugPrintfTests(unittest.TestCase):
+    def test_debugprintf_by_name_as_spirv_dis_writes_it(self):
+        # old #4322: the instruction name spirv-dis prints for NonSemantic.DebugPrintf was refused as an integer.
+        def module(inst):
+            return (
+                'OpCapability Shader\nOpExtension "SPV_KHR_non_semantic_info"\n'
+                '%dp = OpExtInstImport "NonSemantic.DebugPrintf"\nOpMemoryModel Logical GLSL450\n'
+                'OpEntryPoint GLCompute %main "main"\nOpExecutionMode %main LocalSize 1 1 1\n'
+                '%fmt = OpString "x=%u"\n%void = OpTypeVoid\n%fn = OpTypeFunction %void\n%uint = OpTypeInt 32 0\n'
+                '%u7 = OpConstant %uint 7\n%main = OpFunction %void None %fn\n%l = OpLabel\n'
+                f'%p = OpExtInst %void %dp {inst} %fmt %u7\nOpReturn\nOpFunctionEnd\n'
+            )
+        spv = spirv_asm.assemble(module("DebugPrintf"))
+        self.assertEqual(spv, spirv_asm.assemble(module("1")))
+        ext_inst = _literal_words(spv, 12, 0)
+        self.assertEqual(len(ext_inst), 6)          # result type, result, set, instruction, format, one argument
+        self.assertEqual(ext_inst[3], 1)
+        _validate(spv)
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, "invalid integer literal 'Printf'"):
+            spirv_asm.assemble(module("Printf"))
 
 
 if __name__ == "__main__":

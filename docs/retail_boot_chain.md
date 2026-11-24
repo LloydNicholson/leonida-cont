@@ -88,10 +88,12 @@ proxy gets all 581 lists created and closed.
 Xbox device slot 133 is `(va, const D3D12_RESOURCE_DESC*, state, clear, riid, out)` with `riid = IID_ID3D12Resource`
 and `state = 0xFFFFFFFF`, which isn't a valid PC state. At the first call, `va` is the start of a physical-page
 range the title had just reserved, and `desc` is a buffer of that range's size with Xbox bits in `Flags` above
-the PC flags. The shape matches the console `CreatePlacedResourceX`. The local stand-in creates a committed
-DEFAULT-heap buffer from the desc, with `Flags` limited to the PC bits and `D3D12_RESOURCE_STATE_COMMON`. It is
-not tied to the VA, so what the title writes there doesn't reach the GPU. A real implementation needs the page
-mapper (#5378) or an imported host allocation.
+the PC flags. The shape matches the console `CreatePlacedResourceX`. A buffer on those pages is imported with
+`VK_EXT_external_memory_host` where the driver allows it, so the title's writes are the GPU's reads; a driver that
+refuses falls back to a committed buffer. A texture gets a committed texture whose `GetGPUVirtualAddress` is the
+title's address (the console behavior: a title clears a texture through that pointer), but its pixels do not alias
+the title's pages yet. Both paths limit `Flags` to the PC bits; the buffer path also makes the Xbox layout word
+`ROW_MAJOR`.
 
 The proxy's slot table must also be longer than the title's highest slot. A shorter table leaves a null pointer,
 not an `E_NOTIMPL`.

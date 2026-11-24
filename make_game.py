@@ -69,10 +69,11 @@ if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an old
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
-from mc_command import mc_command  # noqa: E402
+from mc_command import install_hint as mc_install_hint, mc_command  # noqa: E402
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
+from stale_build import newer_sources  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -298,6 +299,14 @@ def appdata_hint(cmd: str) -> str:
     return ""
 
 
+def spirv_tools_hint() -> str:
+    """Where spirv-as and spirv-val come from on this OS."""
+    if os.name == "nt" or sys.platform == "darwin":
+        return "install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)"
+    return ("install your distribution's SPIRV-Tools package (Debian and Ubuntu: sudo apt install spirv-tools), "
+            "or the Vulkan SDK, https://vulkan.lunarg.com/")
+
+
 def need(exe: str, hint: str) -> str:
     if not tool_available(exe):
         fail(f"'{exe}' was not found on PATH. {hint}")
@@ -318,6 +327,17 @@ def versions() -> list:
 PROBES = ("MicrosoftGame.Config", "Catalog000.bin", "appdata0.rpf")
 
 
+def other_case(folder: str, name: str) -> "str | None":
+    """A file in folder whose name differs from name only in letter case, or None. Only reached when name itself is
+    missing, which on a case-insensitive file system (Windows, macOS by default) means no variant exists either;
+    on Linux a copy whose names were lower-cased on the way is otherwise reported as just missing."""
+    try:
+        with os.scandir(folder) as it:
+            return next((e.name for e in it if e.name != name and e.name.casefold() == name.casefold()), None)
+    except OSError:
+        return None
+
+
 def probe_mismatches(game: str, version: dict) -> list[str]:
     """Describe which probe files prevent a version match, using only filesystem metadata."""
     files = version["files"]
@@ -331,7 +351,11 @@ def probe_mismatches(game: str, version: dict) -> list[str]:
         try:
             info = os.stat(os.path.join(game, name))
         except (FileNotFoundError, NotADirectoryError):
-            mismatches.append(f"Missing {name}.")
+            other = other_case(game, name)
+            mismatches.append(f"Missing {name}." if other is None else
+                              f"Missing {name}: there is {other}, but file names are case-sensitive on this file "
+                              f"system and the build opens the package's files by their exact names. Rename it "
+                              f"to {name}, or copy the package again with its names unchanged.")
             continue
         except OSError as error:
             mismatches.append(f"Cannot read file metadata for {name} ({error.strerror}).")
@@ -510,7 +534,8 @@ def find_dumps(containers: list | None = None) -> list:
             if v:
                 found[real] = (d, v)
                 return
-        if depth == 0:
+        # At the last level, inspect packaged files there without visiting any subfolders.
+        if depth == 0 and containers is None:
             return
         try:
             with os.scandir(d) as it:
@@ -520,7 +545,7 @@ def find_dumps(containers: list | None = None) -> list:
         subs = []
         for e in entries:
             try:
-                if e.is_dir(follow_symlinks=False):
+                if depth > 0 and e.is_dir(follow_symlinks=False):
                     if e.name.lower() not in skip and not e.name.startswith((".", "$")):
                         subs.append(e.path)
                 elif containers is not None and e.name.lower().endswith(CONTAINER_SUFFIXES) \
@@ -836,14 +861,11 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if "shaders" in stages:
         mc = mc_command()[0]
         if not (os.path.isfile(mc) or shutil.which(mc)):
-            missing.append(
-                "llvm-mc (LLVM 21+ with the AMDGPU target). The official Windows LLVM build has no AMDGPU "
-                "target: build a native one with scripts\\build_llvm_mc.ps1, or install llvm-21 in WSL and set "
-                "LLVM_MC to the whole command, e.g. "
-                "LLVM_MC=\"wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc\" (docs/design.md)." + appdata_hint(mc))
+            missing.append("llvm-mc (LLVM 21+ with the AMDGPU target). " + mc_install_hint().replace("\n", " ")
+                           + " (docs/design.md)." + appdata_hint(mc))
         for t in ("spirv-as", "spirv-val"):
             if not shutil.which(t):
-                missing.append(f"{t}: install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)")
+                missing.append(f"{t}: " + spirv_tools_hint())
     if "assets" in stages:
         if not dotnet_sdk_ok():
             missing.append(".NET 8 SDK (the .NET runtime alone can't build rpf9dump): "
@@ -899,12 +921,16 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
              "Free some space or choose another drive with --work." + hint)
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         cross_configure()
-    if "pipelines" in stages and os.name != "nt" and not pipeline_check_exe():
-        build_pipeline_check(jobs)
-        if not pipeline_check_exe():
-            fail("vk_pipeline_check built, but not as runtime/build/linux/vk_pipeline_check (a multi-config "
-                 "generator puts it in a subfolder): unset CMAKE_GENERATOR if it names one, delete "
-                 "runtime/build/linux and run the build again.")
+    if "pipelines" in stages and os.name != "nt":
+        checker = pipeline_check_exe()
+        # A checker built before a pull is rebuilt too; cmake --build only recompiles what changed. Without CMake
+        # the pipelines stage says it is out of date and uses it.
+        if not checker or (stale_checker(checker) and shutil.which("cmake")):
+            build_pipeline_check(jobs)
+            if not pipeline_check_exe():
+                fail("vk_pipeline_check built, but not as runtime/build/linux/vk_pipeline_check (a multi-config "
+                     "generator puts it in a subfolder): unset CMAKE_GENERATOR if it names one, delete "
+                     "runtime/build/linux and run the build again.")
     if "assets" in stages:
         ensure_submodule()
 
@@ -1036,7 +1062,7 @@ def ensure_submodule() -> None:
     core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
     if submodule_ready():
         return
-    clone = "git clone --recursive https://github.com/ItsNotRexed/Leonida"
+    clone = "git clone --recursive https://github.com/ubiquitarianism/leonida"
     git = shutil.which("git")
     if not git:
         fail("third_party/rpf9-explorer is missing (a \"Download ZIP\" from GitHub leaves it out). Install Git "
@@ -1317,6 +1343,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     verify_translation_completeness(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
+    library_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
 
@@ -1344,13 +1371,20 @@ def fspx_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[s
 
 
 def fspx_cache_complete(spirv: str) -> bool:
-    """Check that the FSPX translation index names at least one program and that its named modules are present.
-    A translation that produced no modules writes a bare `{}`, which must not be cached as a finished step."""
+    """Require a runtime-addressable compute program and all of the modules in the saved translation index."""
     try:
         index = json.loads(read_shader_setting(os.path.join(spirv, "index.json")))
     except ValueError:
         return False
-    return isinstance(index, dict) and bool(index) and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
+    if not isinstance(index, dict):
+        return False
+    # The translator can write a module with an error-only metadata row. Such a module has no runtime lookup key.
+    has_compute_key = any(
+        isinstance(meta, dict) and meta.get("stage") == "cs"
+        and isinstance(meta.get("fspx_code_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", meta["fspx_code_sha256"])
+        for meta in index.values()
+    )
+    return has_compute_key and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
 
 
 def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
@@ -1384,14 +1418,83 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
     py("fspx_unpack.py", dll, "--out", unpacked, "--disasm")
     extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
     py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", *extra)
-    clash = fspx_key_clash(spirv)
-    if clash:
-        drop(translated)   # the runtime must not load an index whose keys pick between different modules
-        fail(f"shaders: FSPX programs {clash[0]} and {clash[1]} have the same kind-6 and kind-0 bytes "
-             "(fspx_code_sha256 and fspx_state_sha256) but different translated modules, so the runtime could not "
-             "tell which one a pipeline means (docs/fspx.md, \"Build and run-time lookup\")")
+    verify_fspx_key_clash(spirv, translated, "FSPX")
     with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
         f.write(settings + "\n")
+
+
+LIBRARY_ARCHIVE = "shaders.rpf"
+LIBRARY_TOOLS = ("shader_library.py", "fspx_unpack.py", "shader_disasm.py")  # with TRANSLATION_SOURCES
+
+
+def library_settings(archive: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
+    """What the pipeline library's compute translations depend on, as one line: shaders.rpf, the unpacking and
+    translating tools, llvm-mc, the wave64 mode and the fallback flags."""
+    return json.dumps({"archive": file_sha256(archive), "tools": sources_digest(TOOLS, LIBRARY_TOOLS),
+                       "translator": translation_sources_digest(), "llvm_mc": mc_signature,
+                       "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)}, sort_keys=True)
+
+
+def library_shaders(game: str, work: str, mc_signature: str, jobs: int, emulate: bool = False,
+                    fallbacks: tuple[str, ...] = ()) -> None:
+    """The compute pipelines of the pipeline library in shaders.rpf (docs/shader_library.md). The executable reads
+    the library through DirectStorage and creates each compute pipeline with Xbox device slot 67
+    (DeserializeComputePipelineStateX), passing the record's four parts as FSPX kinds 0, 1, 6 and 7 (docs/fspx.md).
+    tools/shader_library.py unpacks the compute programs with their kind-0 state into <work>/shaders/library, and
+    translate() runs rdna2spirv.py across jobs processes into <work>/shaders/spirv/library, where the runtime's
+    shader library finds them by fspx_code_sha256 and fspx_state_sha256 as it finds the FidelityFX DLL's. Graphics
+    pipelines are not translated here. The game's own shaders neither feed nor depend on this step, apart from the
+    carve that names each program's source container (the translator reads its signatures).
+
+    The step runs whole. Reuse requires the translation index, its named modules and a matching library_build.json
+    (library_settings)."""
+    archive = os.path.join(game, LIBRARY_ARCHIVE)
+    unpacked = os.path.join(work, "shaders", "library")
+    spirv = os.path.join(work, "shaders", "spirv", "library")
+    translated = os.path.join(spirv, "index.json")
+    shard_plan = os.path.join(spirv, SHARD_PLAN)
+    settings_file = os.path.join(spirv, "library_build.json")
+    if not os.path.isfile(archive):
+        drop(translated, settings_file, shard_plan)
+        log(f"shaders: no {LIBRARY_ARCHIVE} in the game folder, so no pipeline library to translate")
+        return
+    settings = library_settings(archive, mc_signature, emulate, fallbacks)
+    if read_shader_setting(settings_file) == settings and fspx_cache_complete(spirv):
+        return
+    log(f"shaders: unpacking and translating the compute pipelines of the pipeline library in {LIBRARY_ARCHIVE}")
+    drop(translated, settings_file, shard_plan)
+    # A program that no longer translates or lost its carve container must not keep outputs from the run before.
+    for folder, suffixes in ((unpacked, (".dxbc",)),
+                             (os.path.join(unpacked, "fspx"), (".code", ".state", ".json")),
+                             (os.path.join(unpacked, "disasm"), (".s",)),
+                             (spirv, (".spv", ".spvasm"))):
+        if os.path.isdir(folder):
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
+                        os.unlink(entry.path)
+    carve = os.path.join(work, "shaders", "dxbc")
+    py("shader_library.py", archive, "--out", unpacked, "--stages", "cs", "--disasm", "--jobs", str(jobs),
+       *(["--carve", carve] if os.path.isdir(carve) else []))
+    translate(os.path.join(unpacked, "disasm"), spirv, jobs, emulate=emulate, fallbacks=fallbacks)
+    verify_fspx_key_clash(spirv, translated, "pipeline library")
+    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write(settings + "\n")
+
+
+def verify_fspx_key_clash(spirv: str, translated: str, label: str) -> None:
+    """Reject an unreadable translation index or one whose kind-6 and kind-0 keys pick between different modules."""
+    try:
+        clash = fspx_key_clash(spirv)
+    except (OSError, ValueError, TypeError) as error:
+        drop(translated)
+        fail(f"shaders: {label} translation wrote an unreadable index "
+             f"({getattr(error, 'strerror', None) or error}); run the shaders stage again")
+    if clash:
+        drop(translated)   # the runtime must not load an index whose keys pick between different modules
+        fail(f"shaders: {label} programs {clash[0]} and {clash[1]} have the same kind-6 and kind-0 bytes "
+             "(fspx_code_sha256 and fspx_state_sha256) but different translated modules, so the runtime could not "
+             "tell which one a pipeline means (docs/fspx.md, \"Build and run-time lookup\")")
 
 
 def fspx_key_clash(spirv: str):
@@ -1400,6 +1503,8 @@ def fspx_key_clash(spirv: str):
     picks by both keys when the bytecode carries kind 0, and refuses a bare kind-6 program whose modules differ."""
     with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
         index = json.load(f)
+    if not isinstance(index, dict):
+        raise ValueError("index.json must contain a JSON object")
     first = {}
     for name in sorted(index):
         meta = index[name]
@@ -1677,6 +1782,23 @@ def barycentric_fallback_override():
     return None
 
 
+# VkDriverId of Intel's Windows Vulkan driver (igvk64.dll).
+VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS = 5
+
+
+def runtime_gpu_mesh_draws_crash():
+    """True where the GPU the runtime would use is on Intel's Windows Vulkan driver with VK_EXT_mesh_shader: there
+    vkCmdDrawMeshTasksEXT crashes (0xC0000409 in igvk64.dll) for a mesh shader with a live push-constant load at
+    byte offset 32 or more, which every corpus mesh shader has (BUILD-2202, measured on an Arc A770 with driver
+    32.0.101.9175; --mesh-compute is exact there). No fixed driver version is known, so every one counts. False
+    for any other GPU or one without mesh shaders, None when tools/vk_subgroup_info.py can't tell."""
+    info = runtime_gpu_info()
+    if not info or "driver_id" not in info:
+        return None
+    return info.get("driver_id") == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS and \
+        info.get("mesh_in_supported_stages") is True
+
+
 def runtime_gpu_max_push_constants():
     """max_push_constants_size as tools/vk_subgroup_info.py answers for the GPU the runtime would use, or None."""
     v = runtime_gpu_info().get("max_push_constants_size")
@@ -1686,7 +1808,8 @@ def runtime_gpu_max_push_constants():
 # Source and data files that produce the translated modules, metadata and partner stubs.
 TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
                        "wave64_emulate_opt.py", "shader_meta.py", "spirv_stubs.py", "spirv_asm.py", "spirv_asm_tables.py",
-                       "spirv_opt.py", "report_paths.py", "replace_retry.py", "gfx10_formats.json")
+                       "spirv_opt.py", "report_paths.py", "replace_retry.py", "fssm_unpack.py", "shader_stage_manifest.py",
+                       "gfx10_formats.json")
 
 
 def sources_digest(folder: str, names, lead: str = "") -> str:
@@ -2313,6 +2436,13 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         log(f"runtime: built. Inspect the game's imports with Wine:\n  {shlex.join([start, '--dry-run'])}")
 
 
+def nonempty_path(text: str) -> str:
+    """--game/--out/--work/--runtime-build: an empty value would read as 'not given' and fall back to a default."""
+    if text.strip() == "":
+        raise argparse.ArgumentTypeError("must not be empty")
+    return text
+
+
 def positive_int(text: str) -> int:
     """--jobs: 0 or less would start no translation shard and merge an empty index as if the step had finished."""
     try:
@@ -2336,13 +2466,25 @@ def pipeline_check_exe(runtime_build: str | None = None) -> str | None:
     return next((p for p in found if os.path.isfile(p) and (windows or os.access(p, os.X_OK))), None)
 
 
+def stale_checker(exe: str) -> list:
+    """The sources of vk_pipeline_check changed after `exe` was built, when `exe` is in this checkout's runtime/build.
+    A checker from elsewhere (--runtime-build) isn't compared: its time stamp says nothing about these sources."""
+    build = os.path.abspath(os.path.join(ROOT, "runtime", "build"))
+    try:
+        if os.path.commonpath([build, os.path.abspath(exe)]) != build:
+            return []
+    except ValueError:   # another drive
+        return []
+    return newer_sources(exe, ROOT, "vk_pipeline_check")
+
+
 def require_translated_shaders(work: str) -> str:
     spirv = os.path.join(work, "shaders", "spirv")
     index = os.path.join(spirv, "index.json")
     if not os.path.isfile(index):
         fail("No translated shaders yet: run the shaders stage first.")
     try:
-        with open(index, encoding="utf-8") as f:
+        with open(index, encoding="utf-8-sig") as f:
             translated = json.load(f)
     except (OSError, ValueError) as e:
         fail(f"The translated shader index {index} is unreadable ({getattr(e, 'strerror', None) or e}): "
@@ -2361,13 +2503,21 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         fail("vk_pipeline_check wasn't built. With CMake 3.24+, a C++20 compiler and the Vulkan headers and "
              "loader installed, run: cmake -S runtime -B runtime/build/linux && "
              "cmake --build runtime/build/linux --parallel")
+    newer = stale_checker(exe)
+    if newer:
+        rebuild = ("run the runtime stage with VULKAN_SDK set" if os.name == "nt" else
+                   "cmake --build runtime/build/linux --target vk_pipeline_check")
+        more = f" and {len(newer) - 3} more" if len(newer) > 3 else ""
+        log(f"pipelines: WARNING: {exe} is older than {', '.join(newer[:3])}{more}, so it is not this checkout's "
+            f"checker; to rebuild it, {rebuild}")
     spirv = require_translated_shaders(work)
     log("pipelines: creating every shader module and pipeline (compute and graphics) on this GPU")
     os.makedirs(out, exist_ok=True)
     cache = os.path.join(out, "pipeline_cache.bin")
     inflight = os.path.join(out, "pipeline_inflight.txt")
     skip = os.path.join(out, "pipeline_crashes.txt")
-    drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
+    report = os.path.join(out, "pipeline_crashes.json")
+    drop(inflight, skip, report)   # every module gets a fresh chance on each run (a new translator may have fixed it)
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
     base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else [])]
     if not checker_supports(exe, "--inflight-file", "--skip-file"):
@@ -2414,6 +2564,10 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
                         return first
                     second = check_range(start + half, count - half)
                     return second or first
+                # The give-up path is exactly when a durable record matters: a module was named earlier,
+                # but the driver now aborts before it can name another one. fail() raises, so write first.
+                if crashed:
+                    record_crashes(out, spirv, crashed)
                 fail(f"vk_pipeline_check exited with {exit_label(code)} while no module could be named as the cause; "
                      "the checker could not finish even this range in a fresh process; check available memory "
                      "and report it if it keeps happening")
@@ -2422,6 +2576,8 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             crashed.extend(suspects)
             with open(skip, "w", encoding="utf-8", newline="\n") as f:
                 f.write("".join(n + "\n" for n in crashed))
+        if crashed:
+            record_crashes(out, spirv, crashed)
         fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "
              + ", ".join(crashed))
 
@@ -2438,12 +2594,34 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             break
     if crashed and not code:
         code = 1
+    if crashed:
+        record_crashes(out, spirv, crashed)
     drop(inflight)
     if code != 0:
-        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
-            if crashed else ""
+        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed (with their SPIR-V " \
+              f"hashes in pipeline_crashes.json): " + ", ".join(crashed) if crashed else ""
         fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
     log("pipelines: done")
+
+
+def record_crashes(out: str, spirv: str, crashed: "list[str]") -> None:
+    """pipeline_crashes.json: name and SHA-256 of each module that took the driver down, so a report names the
+    exact translation without attaching the shader. OSError (a missing .spv) leaves that module's hash null."""
+    def digest(name: str) -> "str | None":
+        try:
+            with open(os.path.join(spirv, name + ".spv"), "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            return None
+    doc = {"modules": [{"name": n, "spv_sha256": digest(n)} for n in crashed]}
+    try:
+        with open(os.path.join(out, "pipeline_crashes.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f, indent=1)
+            f.write("\n")
+    except OSError as error:
+        # The durable record is best-effort. A report path that cannot be written must not
+        # replace the checker diagnostic that names the modules which took the driver down.
+        log(f"pipelines: cannot write pipeline_crashes.json: {error.strerror or error}")
 
 
 # How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the
@@ -2489,7 +2667,7 @@ def pipeline_names(spirv: str) -> "list[str]":
     """The checker's name-sorted index (byte order, as its std::map); ranges and diagnostic probes share it."""
     path = os.path.join(spirv, "index.json")
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             index = json.load(f)
     except (OSError, ValueError) as e:
         fail(f"pipelines: cannot read {path}: {getattr(e, 'strerror', None) or e}")
@@ -2650,12 +2828,12 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the PC port from your own copy of the game.")
-    ap.add_argument("--game", help="your package folder (found automatically if left out; a share path "
+    ap.add_argument("--game", type=nonempty_path, help="your package folder (found automatically if left out; a share path "
                                     "\\\\server\\share\\... goes here)")
     ap.add_argument("--pick", action="store_true", help="choose your package folder in a folder dialog")
-    ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida; ~/Leonida on a Mac "
+    ap.add_argument("--out", type=nonempty_path, help="folder for the finished port (default Documents/Leonida; ~/Leonida on a Mac "
                                   "whose Documents iCloud syncs)")
-    ap.add_argument("--work", help="folder for intermediate files (hundreds of GB; default <out>/work)")
+    ap.add_argument("--work", type=nonempty_path, help="folder for intermediate files (hundreds of GB; default <out>/work)")
     ap.add_argument("--stages", help="comma list from: " + ",".join(STAGES))
     ap.add_argument("--check", action="store_true", help="only check the game files")
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
@@ -2663,7 +2841,7 @@ def main() -> int:
                     help="also decode the Ogg Opus audio to 16-bit PCM WAV (much larger; needs ffmpeg)")
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
-    ap.add_argument("--runtime-build", metavar="DIR",
+    ap.add_argument("--runtime-build", metavar="DIR", type=nonempty_path,
                     help="a Windows build of runtime/ (gta6rt.exe and gta6rt_tls_host.dll) for the runtime stage "
                          "instead of building it (off Windows: instead of the clang-cl + xwin cross-build); "
                          "on Windows, also use vk_pipeline_check.exe from DIR if present")
@@ -2687,7 +2865,11 @@ def main() -> int:
                          "PerVertexKHR inputs; on by itself when the runtime's GPU can't use them (MoltenVK)")
     ap.add_argument("--mesh-compute", action="store_true",
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
-                         "without VK_EXT_mesh_shader")
+                         "without VK_EXT_mesh_shader; on by itself on Intel's Windows Vulkan driver, whose mesh "
+                         "draws crash on the corpus' mesh shaders (BUILD-2202)")
+    ap.add_argument("--native-mesh", action="store_true",
+                    help="keep native mesh shaders on Intel's Windows Vulkan driver instead of turning on "
+                         "--mesh-compute (for a driver that fixes BUILD-2202's crash)")
     ap.add_argument("--pc-tail-ubo", action="store_true",
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
@@ -2755,6 +2937,14 @@ def main() -> int:
             stages = [s for s in stages if s not in WINDOWS_ONLY]
             log(f"{', '.join(WINDOWS_ONLY)}: left out, the cross-build needs {'; '.join(lacking)} "
                 "(or pass --runtime-build)")
+    if "shaders" in stages and not a.mesh_compute and not a.native_mesh:
+        crash = runtime_gpu_mesh_draws_crash()
+        if crash:
+            log("shaders: the GPU the runtime would use is on Intel's Windows Vulkan driver, whose mesh draws crash on "
+                "these mesh shaders (BUILD-2202): translating with --mesh-compute (--native-mesh keeps them native)")
+            a.mesh_compute = True
+        elif crash is None:
+            a.mesh_compute = keep_recorded_fallback("--mesh-compute", work)
     emulate, keep_emulated = (wave64_settings(a.wave64_emulate, mesh_compute=a.mesh_compute) if "shaders" in stages
                               else (False, a.wave64_emulate == "auto"))
     if "shaders" in stages and not a.f16_interp_fallback:
