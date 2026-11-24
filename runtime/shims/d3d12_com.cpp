@@ -13,9 +13,11 @@
 #include <bit>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <set>
@@ -26,6 +28,117 @@
 #include <vector>
 
 namespace rt::d3d12 {
+
+// Test-branch diagnostic (LEONIDA_DRAW_DIAG=1), declared in d3d12_com.h. Counts at record time, not at execution.
+namespace draw_diag {
+namespace {
+struct State {
+    std::mutex mutex;
+    std::uint64_t outcome[3]{};
+    std::uint64_t dispatches = 0;
+    std::uint64_t presents = 0;
+    std::vector<std::pair<leonida::ResourceId, std::uint64_t>> drawn;    // resource -> recorded draws into it
+    std::vector<std::pair<leonida::ResourceId, std::uint64_t>> cleared;  // resource -> clears
+    std::uint64_t max_vertices = 0;
+    std::map<std::uintptr_t, std::string> pipelines;
+    unsigned detailed = 0;  // draws printed in full (the first frames only)
+};
+State& state() {
+    static State s;
+    return s;
+}
+void bump(std::vector<std::pair<leonida::ResourceId, std::uint64_t>>& v, leonida::ResourceId r) {
+    for (auto& [id, n] : v)
+        if (id == r) { ++n; return; }
+    if (v.size() < 64) v.push_back({r, 1});
+}
+std::uint64_t count_of(const std::vector<std::pair<leonida::ResourceId, std::uint64_t>>& v, leonida::ResourceId r) {
+    for (const auto& [id, n] : v)
+        if (id == r) return n;
+    return 0;
+}
+}  // namespace
+
+bool enabled() {
+    static const bool on = [] { const char* v = std::getenv("LEONIDA_DRAW_DIAG"); return v && *v == '1'; }();
+    return on;
+}
+
+void note_pipeline(std::uintptr_t pipeline, std::string summary) {
+    State& s = state();
+    std::lock_guard lock(s.mutex);
+    s.pipelines[pipeline] = std::move(summary);
+}
+
+void note_draw(int outcome, const leonida::TargetView* targets, UINT target_count, UINT vertices, UINT instances,
+               std::uintptr_t pipeline, const leonida::TargetView* depth, const leonida::Viewport* viewport,
+               const leonida::VertexBufferView* vb0) {
+    State& s = state();
+    std::lock_guard lock(s.mutex);
+    ++s.outcome[outcome];
+    if (outcome != 0) return;
+    if (s.presents < 4 && s.detailed < 24) {
+        ++s.detailed;
+        const auto it = s.pipelines.find(pipeline);
+        std::fprintf(stderr,
+                     "[rt] drawdiag:   draw (before present %llu) verts=%u inst=%u rt0=0x%llx rt0fmt=%d rts=%u depth=0x%llx "
+                     "viewport=%gx%g depth %g..%g vb0 va=0x%llx size=%u stride=%u | pso 0x%llx %s\n",
+                     static_cast<unsigned long long>(s.presents + 1), vertices, instances,
+                     static_cast<unsigned long long>(target_count && targets ? targets[0].resource : 0),
+                     target_count && targets ? int(targets[0].format) : -1, target_count,
+                     static_cast<unsigned long long>(depth ? depth->resource : 0), viewport ? viewport->width : 0.0f,
+                     viewport ? viewport->height : 0.0f, viewport ? viewport->min_depth : 0.0f,
+                     viewport ? viewport->max_depth : 0.0f,
+                     static_cast<unsigned long long>(vb0 ? vb0->va : 0), vb0 ? vb0->size : 0u, vb0 ? vb0->stride : 0u,
+                     static_cast<unsigned long long>(pipeline),
+                     it != s.pipelines.end() ? it->second.c_str() : "(state not recorded)");
+    }
+    s.max_vertices = std::max<std::uint64_t>(s.max_vertices, std::uint64_t(vertices) * std::max(1u, instances));
+    for (UINT i = 0; i < target_count && targets; ++i)
+        if (targets[i].resource) bump(s.drawn, targets[i].resource);
+    if (!target_count) bump(s.drawn, 0);  // depth-only draws
+}
+
+void note_clear(leonida::ResourceId resource) {
+    State& s = state();
+    std::lock_guard lock(s.mutex);
+    bump(s.cleared, resource);
+}
+
+void note_dispatch() {
+    State& s = state();
+    std::lock_guard lock(s.mutex);
+    ++s.dispatches;
+}
+
+void report_present(UINT plane_count, leonida::ResourceId presented) {
+    State& s = state();
+    std::lock_guard lock(s.mutex);
+    const std::uint64_t n = ++s.presents;
+    if (n <= 20 || n % 100 == 0) {
+        std::fprintf(stderr,
+                     "[rt] drawdiag: present %llu planes=%u resource=0x%llx | draws recorded=%llu no-pipeline=%llu "
+                     "no-viewport=%llu dispatches=%llu max-verts=%llu | into presented: draws=%llu clears=%llu | "
+                     "targets drawn=%zu cleared=%zu\n",
+                     static_cast<unsigned long long>(n), plane_count, static_cast<unsigned long long>(presented),
+                     static_cast<unsigned long long>(s.outcome[0]), static_cast<unsigned long long>(s.outcome[1]),
+                     static_cast<unsigned long long>(s.outcome[2]), static_cast<unsigned long long>(s.dispatches),
+                     static_cast<unsigned long long>(s.max_vertices),
+                     static_cast<unsigned long long>(count_of(s.drawn, presented)),
+                     static_cast<unsigned long long>(count_of(s.cleared, presented)), s.drawn.size(), s.cleared.size());
+        if (n <= 3)
+            for (const auto& [id, k] : s.drawn)
+                std::fprintf(stderr, "[rt] drawdiag:   present %llu drawn target 0x%llx: %llu draws\n",
+                             static_cast<unsigned long long>(n), static_cast<unsigned long long>(id),
+                             static_cast<unsigned long long>(k));
+    }
+    s.outcome[0] = s.outcome[1] = s.outcome[2] = 0;
+    s.dispatches = 0;
+    s.max_vertices = 0;
+    s.drawn.clear();
+    s.cleared.clear();
+}
+}  // namespace draw_diag
 
 struct TileGrid {
     std::uint64_t columns = 0;
@@ -379,6 +492,7 @@ public:
     void STDMETHODCALLTYPE Dispatch(UINT x, UINT y, UINT z) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::Dispatch");
         if (defer([=](GraphicsCommandList& l) { l.record_dispatch(x, y, z); }, true)) return;
+        if (draw_diag::enabled()) draw_diag::note_dispatch();
         record_dispatch(x, y, z);
     }
 
@@ -710,6 +824,8 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr || !color) return check(false);
+        if (draw_diag::enabled())
+            draw_diag::note_clear(reinterpret_cast<const leonida::TargetView*>(view.ptr)->resource);
         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(view.ptr),
                                         {color[0], color[1], color[2], color[3]}, to_rects(count, rects)));
     }
@@ -1434,11 +1550,22 @@ private:
 
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
-        if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
+        if (!graphics_pipeline_ || !graphics_.layout || !topology_) {
+            if (draw_diag::enabled())
+                draw_diag::note_draw(1, render_targets_.data(), render_target_count_, count, instances);
+            return check(false);
+        }
         note_direct_heap_indexing(graphics_.layout);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
-        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+        if (!(viewport_.width > 0) || !(viewport_.height > 0)) {
+            if (draw_diag::enabled())
+                draw_diag::note_draw(2, render_targets_.data(), render_target_count_, count, instances);
+            return;
+        }
+        if (draw_diag::enabled())
+            draw_diag::note_draw(0, render_targets_.data(), render_target_count_, count, instances, graphics_pipeline_,
+                                 &depth_, &viewport_, &draw_views()->vertex_buffers[0]);
         leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};
@@ -1671,8 +1798,12 @@ public:
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success)
-            std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
-                         name(last_result_));
+            std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted%s\n",
+                         name(last_result_),
+                         last_result_ == leonida::ReplayResult::unresolved_resource
+                             ? (" (test branch: vulkan_replay.h line " +
+                                std::to_string(leonida::g_unresolved_line.load(std::memory_order_relaxed)) + ")").c_str()
+                             : "");
     }
 
     // A copy list's timestamps go to COPY_QUEUE_TIMESTAMP heaps and every other list's to TIMESTAMP heaps.

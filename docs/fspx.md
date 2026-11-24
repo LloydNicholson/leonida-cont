@@ -263,9 +263,12 @@ title calls device slot 57 (`+0x1c8`) with `IID_ID3D12PipelineState` (`{765a30f3
   - `+0x4c`: u32 element count (`3` across the library)
   - `+0x50`: u32 maximum name stride including NUL (`9` or `6`)
   - `+0x54..`: variable-length element array. Each element is a NUL-terminated ASCII semantic name followed by 7 u32s
-    (28 B): `+0x00` `InputSlot` (`0`), `+0x04` `DXGI_FORMAT` (`6` = `R32G32B32_FLOAT` for `POSITION` at `0x54`/`0x5d`,
+    (28 B): `+0x00` `SemanticIndex` (`0`; `1` for the second `COLOR` of the retail boot's refused layouts), `+0x04` `DXGI_FORMAT` (`6` = `R32G32B32_FLOAT` for `POSITION` at `0x54`/`0x5d`,
     `28` = `R8G8B8A8_UNORM` for `COLOR` at `0x79`/`0x7f`, `16` = `R32G32_FLOAT` for `TEXCOORD` at `0x9b`/`0xa4`),
-    `+0x08` `SemanticIndex` (`0`), `+0x0c` `AlignedByteOffset` (`0`, `12`, `16`). The stored blob truncates the unused
+    `+0x08` `InputSlot` (`0`), `+0x0c` `AlignedByteOffset` (`0`, `12`, `16`), `+0x18` the next element's name
+    length with its NUL (`0` after the last). `+0x00` and `+0x08` were swapped here before: both are `0` in the three
+    boot PSOs, and a layout `COLOR`(`+0x00` 0, offset 0), `COLOR`(`+0x00` 1, offset 4), `POSITION`(`+0x00` 0, offset 8)
+    with `+0x08` 0 throughout feeds a vertex shader that reads `COLOR0`, `COLOR1`, `POSITION0` only when `+0x00` is the index. The stored blob truncates the unused
     tail of the final 28-byte block by 1..4 bytes (`0xa4 + 28 = 0xc0 > 0xbc` in PSO 1), so the parser bounds-checks
     every 4-byte read against `blob_size`.
 - **Measured `state blob` (380..388 B) and `stage blob` (kind 2):**

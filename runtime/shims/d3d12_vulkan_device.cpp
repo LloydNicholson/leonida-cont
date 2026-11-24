@@ -143,6 +143,66 @@ void copy_title_pages(std::uint8_t* to, const std::uint8_t* from, std::size_t by
     }
 }
 
+// Test branch: the layout of a shadow's title range, kept between refreshes. Querying it took most of a refresh: a buffer
+// over XMemMapPhysicalPages is one view per 64 KiB page, and a VirtualQuery per view made 51 MB copy at ~200 MiB/s
+// against 2.5 GB/s for one large region (retail boot, Wine 11.22). Adjacent regions of one kind are merged into a run.
+struct TitleRun {
+    std::size_t at;
+    std::size_t bytes;
+    bool readable;
+    bool streaming;  // write-combined: read with streaming loads (copy_guarded)
+};
+
+std::vector<TitleRun> title_runs(const std::uint8_t* from, std::size_t bytes) {
+    constexpr DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    std::vector<TitleRun> runs;
+    for (std::size_t at = 0; at < bytes;) {
+        MEMORY_BASIC_INFORMATION region{};
+        std::size_t run = bytes - at;
+        bool read = false, streaming = false;
+        if (VirtualQuery(from + at, &region, sizeof(region))) {
+            const auto end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+            run = std::min<std::size_t>(run, end - reinterpret_cast<std::uintptr_t>(from + at));
+            read = region.State == MEM_COMMIT && (region.Protect & readable) &&
+                   !(region.Protect & (PAGE_GUARD | PAGE_NOACCESS));
+            streaming = (region.Protect & PAGE_WRITECOMBINE) != 0;
+        }
+        if (!runs.empty() && runs.back().readable == read && runs.back().streaming == streaming &&
+            runs.back().at + runs.back().bytes == at)
+            runs.back().bytes += run;
+        else
+            runs.push_back({at, run, read, streaming});
+        at += run;
+    }
+    return runs;
+}
+
+// The same copy as copy_title_pages, through a kept layout. The layout is rebuilt (and this refresh takes the full
+// path) when a readable run faults, or when a run kept as unreadable has become readable: the title commits, frees and
+// re-protects through calls the layer does not all see (kernel32's VirtualFree, xmem's commit on first touch), so the
+// layout is checked against the pages rather than against a record of those calls.
+void copy_title_pages_kept(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, std::vector<TitleRun>& runs) {
+    const auto full = [&] {
+        runs = title_runs(from, bytes);
+        for (const TitleRun& r : runs)
+            if (!r.readable || !copy_guarded(to + r.at, from + r.at, r.bytes, r.streaming)) std::memset(to + r.at, 0, r.bytes);
+    };
+    if (runs.empty()) return full();
+    for (const TitleRun& r : runs) {
+        if (r.readable) continue;
+        const std::vector<TitleRun> now = title_runs(from + r.at, r.bytes);
+        if (now.size() != 1 || now.front().readable) return full();
+    }
+    for (const TitleRun& r : runs) {
+        if (!r.readable) {
+            std::memset(to + r.at, 0, r.bytes);
+        } else if (!copy_guarded(to + r.at, from + r.at, r.bytes, r.streaming)) {
+            return full();
+        }
+    }
+}
+
 // Two test settings that make the standalone device look like a GPU with fewer Vulkan queues, so the path where D3D12
 // queues share a VkQueue runs on any GPU; both together give the Intel UHD 770 on Windows and lavapipe (one family,
 // one queue). LEONIDA_VK_MAX_QUEUES_PER_FAMILY=N (1 to 16): at most N VkQueues per queue family (unset, or not a
@@ -440,6 +500,39 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     }
 }
 
+// Test branch: the console's own depth-stencil formats, which the PC enumeration lacks. HYPOTHESIS from the console SDK's
+// numbering: 118 = D16_UNORM_S8_UINT, 119 = R16_UNORM_X8_TYPELESS (its depth view), 120 = X16_TYPELESS_G8_UINT (its
+// stencil view). The retail boot makes a 2560x1440 texture in 118 with ALLOW_DEPTH_STENCIL and pipelines with DSVFormat
+// 118, and stops on a fail-fast when slot 25 cannot size it. Stand-in: the D24 family (UNORM depth with more bits, the
+// same 8-bit stencil), mapped where a description enters this device; GetDesc then reports the D24 format.
+DXGI_FORMAT pc_alias_format(DXGI_FORMAT format) {
+    switch (static_cast<unsigned>(format)) {
+    case 118: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case 119: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case 120: return DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    default: return format;
+    }
+}
+template <class Desc>
+const Desc* pc_alias_desc(const Desc* in, Desc& copy) {
+    if (!in) return nullptr;
+    copy = *in;
+    copy.Format = pc_alias_format(copy.Format);
+    return &copy;
+}
+
+// Test branch: the other half of the depth-stencil UAV stand-in (d3d12_xs_desc_clean.h). A console depth texture that
+// allowed unordered access has that flag dropped here, so a creation that asks for the UNORDERED_ACCESS state would be
+// refused for it ("UNORDERED_ACCESS state without ALLOW_UNORDERED_ACCESS"); it starts in COMMON instead. The retail
+// title made 768..2048 R16_TYPELESS depth textures that way and dereferenced the null resource (game+0x1e24e80).
+D3D12_RESOURCE_STATES depth_uav_stand_in_state(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state) {
+    if (desc && desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+        (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+        !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && (state & D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        return D3D12_RESOURCE_STATE_COMMON;
+    return state;
+}
+
 Format texture_storage_format(DXGI_FORMAT format, bool depth) {
     return vulkan_format(format == DXGI_FORMAT_A8_UNORM ? DXGI_FORMAT_R8_UNORM : format, depth);
 }
@@ -721,6 +814,7 @@ struct DeviceState {
         const std::uint8_t* pages;  // the title's
         std::uint8_t* mapped;       // the shadow's memory
         std::size_t size;
+        std::vector<TitleRun> runs{};  // test branch: the kept layout (copy_title_pages_kept)
     };
     std::mutex shadow_mutex;  // a leaf: nothing else is taken under it
     std::vector<Shadow> shadows;
@@ -735,20 +829,40 @@ struct DeviceState {
         std::erase_if(shadows, [mapped](const Shadow& s) { return s.mapped == mapped; });
     }
     void refresh_shadows() {
+        // Test branch: host-only time the console never spends (its GPU reads the title's pages directly), so a guest
+        // Sleep sits it out (src/host_stall.h). Write-combined title pages read at ~200 MiB/s here, and once the
+        // texture computer works the title places some 300 MB of them: over a second per submission, which tripped
+        // the title's hang check (null write at game+0x2215c35, 104 s into a retail boot).
+        const rt::host_stall::Scope copying;
         std::lock_guard lock(shadow_mutex);
-        for (const Shadow& s : shadows) {
+        // Test branch: the copies go through each shadow's kept layout (copy_title_pages_kept). Every 100th refresh
+        // logs its total, so a run's log shows what the refresh costs once the layouts are known.
+        static std::uint64_t refreshes = 0;
+        const bool report = ++refreshes % 100 == 0;
+        const auto all_start = std::chrono::steady_clock::now();
+        std::size_t all_bytes = 0;
+        for (Shadow& s : shadows) {
+            all_bytes += s.size;
             if (!shadow_sizes_logged.insert(s.size).second) {
-                copy_title_pages(s.mapped, s.pages, s.size);
+                copy_title_pages_kept(s.mapped, s.pages, s.size, s.runs);
                 continue;
             }
             const auto start = std::chrono::steady_clock::now();
-            copy_title_pages(s.mapped, s.pages, s.size);
+            copy_title_pages_kept(s.mapped, s.pages, s.size, s.runs);
             const double ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-            std::fprintf(stderr, "[rt] d3d12: slot-133 shadow buffer of %llu KiB: copied from the title's pages in "
-                                 "%.3f ms (%.0f MiB/s), paid at every submission\n",
-                         static_cast<unsigned long long>(s.size / 1024), ms,
+            std::fprintf(stderr, "[rt] d3d12: slot-133 shadow buffer of %llu KiB (%zu runs): first copy from the title's "
+                                 "pages in %.3f ms (%.0f MiB/s), paid at every submission\n",
+                         static_cast<unsigned long long>(s.size / 1024), s.runs.size(), ms,
                          ms > 0 ? double(s.size) / (1024.0 * 1024.0) / (ms / 1000.0) : 0.0);
+        }
+        if (report) {
+            const double ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - all_start).count();
+            std::fprintf(stderr, "[rt] d3d12: shadow refresh %llu: %zu buffers, %llu KiB in %.1f ms (%.0f MiB/s)\n",
+                         static_cast<unsigned long long>(refreshes), shadows.size(),
+                         static_cast<unsigned long long>(all_bytes / 1024), ms,
+                         ms > 0 ? double(all_bytes) / (1024.0 * 1024.0) / (ms / 1000.0) : 0.0);
         }
     }
 
@@ -2382,7 +2496,30 @@ public:
         return S_OK;
     }
 
-    HRESULT create_texture(const Format& format, const std::vector<VkFormat>& castable = {}) {
+    HRESULT create_texture(const Format& format, const std::vector<VkFormat>& castable_in = {}) {
+        // Test branch: an 8-bit RGBA or BGRA render target may be viewed as its UNORM or sRGB twin without a castable
+        // list, as the console allows. The retail title renders into a 3840x2160 R8G8B8A8_UNORM_SRGB target through
+        // an R8G8B8A8_UNORM view; refused, every batch that drew into it failed ("unknown resource") and the title
+        // later called through a garbage vtable (game+0x13360a3). The pair becomes the image's format list.
+        std::vector<VkFormat> castable = castable_in;
+        if (castable.empty() && !format.typeless && !format.uint_backed &&
+            (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+            switch (format.format) {
+            case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
+                castable = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB};
+                // The RTV path reads the DXGI list (lists_castable_format), so it names the pair too.
+                if (castable_formats_.empty())
+                    castable_formats_ = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB};
+                break;
+            case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
+                castable = {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB};
+                if (castable_formats_.empty())
+                    castable_formats_ = {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB};
+                break;
+            default:
+                break;
+            }
+        }
         auto& vk = device_.context->vk;
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
@@ -3315,7 +3452,25 @@ struct PipelineStream {
     bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
 };
 
-HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, PipelineStream& out) {
+// LEONIDA_XS_STREAM_ENUM=pc: never read a stream with the console's numbering (below).
+bool console_stream_enum_enabled() {
+    static const bool enabled = [] {
+        char value[8] = {};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_XS_STREAM_ENUM", value, sizeof(value));
+        return !(n == 2 && (value[0] == 'p' || value[0] == 'P') && (value[1] == 'c' || value[1] == 'C'));
+    }();
+    return enabled;
+}
+
+// console_enum: read the types with the console's numbering, which has no gap at 23 where the PC's has one (PC:
+// VIEW_INSTANCING 22, AS 24, MS 25, DEPTH_STENCIL2 26, ...; console: AS 23, MS 24, ...), so a type from 23 on is the PC
+// type one above it. Evidence (docs/retail_boot_intel_host.md section 3): in a retail boot, the 430 streams whose
+// subobject 24 the PC reading took for an AS each carried a payload the size of one of the title's mesh-shader
+// containers (430 of 430; 280 of those sizes match no vertex shader), and none of them had a 25.
+// CreatePipelineState uses it only for a stream the PC reading leaves with an AS and no MS, which the PC runtime
+// refuses (an AS needs an MS) and this layer refuses too, so no stream that works today is read differently.
+HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, PipelineStream& out,
+                              bool console_enum = false) {
     if (!desc.pPipelineStateSubobjectStream || !desc.SizeInBytes) return E_INVALIDARG;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC& g = out.graphics;
     for (auto& target : g.BlendState.RenderTarget) {
@@ -3347,6 +3502,8 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
         if (size - at < sizeof(type)) return E_INVALIDARG;
         std::memcpy(&type, base + at, sizeof(type));
+        if (console_enum && unsigned(type) >= 23 && unsigned(type) < 63)
+            type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(unsigned(type) + 1);
         // The versioned depth-stencil and rasterizer subobjects describe the same state as their base type, so the
         // stream contract counts any two of one family as duplicates; the payload below still follows `type`.
         D3D12_PIPELINE_STATE_SUBOBJECT_TYPE family = type;
@@ -3508,6 +3665,7 @@ public:
         const VkDevice dev = device_.info.device;
         if (registered_) device_.context->remove_pipeline(id());
         if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
+        if (lazy_compute_) vk.vkDestroyPipeline(dev, lazy_compute_, nullptr);
         if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
         if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
@@ -3590,9 +3748,28 @@ public:
     // With `ms` (a pipeline state stream's MS subobject) it is an MS (+ PS) pipeline on VK_EXT_mesh_shader instead:
     // no VS, no vertex input or input assembly (the input layout, topology type and strip cut are ignored, as D3D12
     // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.
-    HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
+    HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc_in, const D3D12_SHADER_BYTECODE* ms = nullptr,
                             const D3D12_SHADER_BYTECODE* as = nullptr) {
         const rt::host_stall::Scope building;  // test branch: reading, patching and compiling are all host-only
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = desc_in;  // test branch: console formats (pc_alias_format)
+        desc.DSVFormat = pc_alias_format(desc.DSVFormat);
+        for (auto& f : desc.RTVFormats) f = pc_alias_format(f);
+        if (draw_diag::enabled()) {  // test-branch diagnostic
+            const auto& b = desc.BlendState.RenderTarget[0];
+            const auto& d = desc.DepthStencilState;
+            char text[320];
+            std::snprintf(text, sizeof(text),
+                          "vs=%d ps=%d elems=%u rts=%u fmt0=%d dsv=%d | depth en=%d write=%d func=%d stencil=%d | "
+                          "blend0 en=%d src=%d dst=%d op=%d mask=0x%x | cull=%d fill=%d clip=%d samples=%u",
+                          int(desc.VS.BytecodeLength != 0), int(desc.PS.BytecodeLength != 0),
+                          desc.InputLayout.NumElements, desc.NumRenderTargets, int(desc.RTVFormats[0]),
+                          int(desc.DSVFormat), int(d.DepthEnable), int(d.DepthWriteMask), int(d.DepthFunc),
+                          int(d.StencilEnable), int(b.BlendEnable), int(b.SrcBlend), int(b.DestBlend), int(b.BlendOp),
+                          unsigned(b.RenderTargetWriteMask), int(desc.RasterizerState.CullMode),
+                          int(desc.RasterizerState.FillMode), int(desc.RasterizerState.DepthClipEnable),
+                          desc.SampleDesc.Count);
+            draw_diag::note_pipeline(id(), text);
+        }
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
@@ -3766,6 +3943,10 @@ public:
                                  stage.name, hash.c_str(), raw_bytes.size());
                     return E_INVALIDARG;
                 }
+                // Test branch: the code base of an FSPX stage is the kind-6 program itself, the bytes the key hashes
+                // (as for compute: "the FSSM blob, or the kind-6 program"). Left empty, a slot 57 stage that reads its
+                // code base asked the arena for 0 bytes and the PSO failed as E_OUTOFMEMORY (over 1,000 in a retail boot).
+                stage.fssm.assign(raw_bytes.begin(), raw_bytes.end());
             } else {
                 log_once("shader bytecode holds no FSSM or FSPX program; bytes", int(stage.code.BytecodeLength));
                 return E_INVALIDARG;
@@ -3818,8 +3999,11 @@ public:
         if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
             log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
         }
-        if (vs_stage.entry && ps_stage.entry && !gs_stage.entry &&
-            (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty())) {
+        // Whether the link below may have edited the VS's and PS's words: such stages keep their modules under
+        // LEONIDA_LAZY_PSO, since the library's words are not what they run.
+        const bool f16_linked = vs_stage.entry && ps_stage.entry && !gs_stage.entry &&
+                                (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty());
+        if (f16_linked) {
             std::string link_error;
             if (!leonida::link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
                                           &link_error, device_.f16_half_top_location)) {
@@ -3857,16 +4041,28 @@ public:
                     stage.words = std::move(patched);
                 }
             }
-            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = stage.words.size() * 4;
-            module_info.pCode = stage.words.data();
-            VkShaderModule module = VK_NULL_HANDLE;
-            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
-            modules_.push_back(module);
             VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             info.stage = stage.bit;
-            info.module = module;
             info.pName = "main";
+            const bool edited = (f16_linked && (&stage == &vs_stage || &stage == &ps_stage)) ||
+                                (depth24_fragment && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT);
+            if (lazy_pso() && !edited) {
+                // LEONIDA_LAZY_PSO: no module is kept; build() makes one from the library's words (the same words
+                // read above) for each pipeline it creates, and destroys it after.
+                recipe_.lazy_modules.emplace_back(stage_infos.size(), *stage.entry);
+            } else {
+                VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                module_info.codeSize = stage.words.size() * 4;
+                module_info.pCode = stage.words.data();
+                VkShaderModule module = VK_NULL_HANDLE;
+                if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
+                modules_.push_back(module);
+                info.module = module;
+            }
+            // A lazy stage reads its words again at build time; an eager one has its module. Test branch: a
+            // rectangle list's vertex stage keeps them, as rect_list_geometry below reads them (clearing them refused
+            // every rectangle-list PSO with "the vertex shader is not a SPIR-V module").
+            if (!(rect_list && &stage == &vs_stage)) stage.words = {};
             subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
             stage_infos.push_back(info);
         }
@@ -4203,8 +4399,13 @@ public:
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
         recipe_.blend = blend;
-        graphics_.pipeline = build(0);
-        if (!graphics_.pipeline) return E_FAIL;
+        // LEONIDA_LAZY_PSO=1: the driver pipeline is built by the first draw that uses it (variant(0) in replay), not
+        // here. The retail title creates some 50,000 graphics PSOs before its first frame and draws with far fewer, so
+        // building them all costs gigabytes of driver memory up front.
+        if (!lazy_pso()) {
+            graphics_.pipeline = build(0);
+            if (!graphics_.pipeline) return E_FAIL;
+        }
         graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
 
         if (code_stage) {
@@ -4287,16 +4488,20 @@ public:
                 }
             }
         }
-        const std::vector<std::uint32_t> words = library->spirv(*entry);
-        if (words.empty()) {
-            std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
-            return E_FAIL;
+        {
+            const std::vector<std::uint32_t> words = library->spirv(*entry);
+            if (words.empty()) {
+                std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
+                return E_FAIL;
+            }
+            // LEONIDA_LAZY_PSO: no module yet; the first dispatch makes one from these words again (lazy_compute).
+            if (!lazy_pso()) {
+                VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                module_info.codeSize = words.size() * 4;
+                module_info.pCode = words.data();
+                if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
+            }
         }
-
-        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        module_info.codeSize = words.size() * 4;
-        module_info.pCode = words.data();
-        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
@@ -4309,23 +4514,23 @@ public:
             pipeline_.bindless_set = device_.bindless->set();
         }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
-        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipeline_info.stage.module = module_;
-        pipeline_info.stage.pName = "main";
-        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
-        subgroup_size_for(*entry, required_size, pipeline_info.stage);
-        pipeline_info.layout = pipeline_.layout;
-        VkResult created = VK_ERROR_UNKNOWN;
+        // The subgroup size is decided (and recorded, and reported if unavailable) here in both modes; the compile
+        // applies it.
         {
-            // The console makes this pipeline from native code at once; the driver's compile of the translated module
-            // is host-only time on the title's thread, which a guest Sleep sits out (src/host_stall.h).
-            const rt::host_stall::Scope compiling;
-            created = vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
-                                                  &pipeline_.pipeline);
+            VkPipelineShaderStageCreateInfo decided{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            decided.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            VkPipelineShaderStageRequiredSubgroupSizeCreateInfo storage{};
+            subgroup_size_for(*entry, storage, decided);
+            compute_subgroup_ = subgroup_requests_.back();
         }
-        if (created != VK_SUCCESS) return E_FAIL;
+        if (lazy_pso()) {
+            // Compiled by the first dispatch that uses it (ComputePipeline::build in replay), as graphics PSOs are.
+            compute_entry_ = std::make_unique<leonida::ShaderEntry>(*entry);
+            pipeline_.build = [this] { return lazy_compute(); };
+        } else {
+            pipeline_.pipeline = compile_compute(module_);
+            if (!pipeline_.pipeline) return E_FAIL;
+        }
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
@@ -4359,7 +4564,72 @@ private:
         VkPipelineDepthStencilStateCreateInfo depth{};
         std::vector<VkPipelineColorBlendAttachmentState> blends;
         VkPipelineColorBlendStateCreateInfo blend{};
+        // LEONIDA_LAZY_PSO: the entries of `stages` (by index) that hold no module; build() makes each from the
+        // library's words for the pipeline it creates.
+        std::vector<std::pair<std::size_t, leonida::ShaderEntry>> lazy_modules;
     };
+
+    // LEONIDA_LAZY_PSO=1: graphics pipelines are built at their first draw and compute pipelines at their first
+    // dispatch, and neither keeps a shader module the runtime did not edit.
+    static bool lazy_pso() {
+        static const bool lazy = [] {
+            const char* v = std::getenv("LEONIDA_LAZY_PSO");
+            return v && *v && *v != '0';
+        }();
+        return lazy;
+    }
+
+    // A shader module of `words`; VK_NULL_HANDLE when they are empty or the driver refuses them.
+    VkShaderModule make_module(const std::vector<std::uint32_t>& words) const {
+        if (words.empty()) return VK_NULL_HANDLE;
+        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        module_info.codeSize = words.size() * 4;
+        module_info.pCode = words.data();
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (device_.context->vk.vkCreateShaderModule(device_.info.device, &module_info, nullptr, &module) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+        return module;
+    }
+
+    // The compute pipeline from `module`, pipeline_.layout and compute_subgroup_; VK_NULL_HANDLE when the driver
+    // refuses it.
+    VkPipeline compile_compute(VkShaderModule module) {
+        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline_info.stage.module = module;
+        pipeline_info.stage.pName = "main";
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
+        leonida::apply_subgroup_request(compute_subgroup_, required_size, pipeline_info.stage);
+        pipeline_info.layout = pipeline_.layout;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        // Test branch: the console makes this pipeline from native code at once; the driver's compile of the translated
+        // module is host-only time on the title's thread, which a guest Sleep sits out (src/host_stall.h).
+        const rt::host_stall::Scope compiling;
+        if (device_.context->vk.vkCreateComputePipelines(device_.info.device, device_.pipeline_cache(), 1,
+                                                         &pipeline_info, nullptr, &pipeline) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+        return pipeline;
+    }
+
+    // LEONIDA_LAZY_PSO: the compute pipeline, compiled by the first dispatch (from any queue) and kept until the PSO
+    // is released. Its module lives only for the compile.
+    VkPipeline lazy_compute() {
+        std::lock_guard lock(variants_mutex_);
+        if (lazy_compute_ || lazy_compute_failed_ || !compute_entry_) return lazy_compute_;
+        const leonida::ShaderLibrary* library = device_.library();
+        const VkShaderModule module = library ? make_module(library->spirv(*compute_entry_)) : VK_NULL_HANDLE;
+        if (module) {
+            lazy_compute_ = compile_compute(module);
+            device_.context->vk.vkDestroyShaderModule(device_.info.device, module, nullptr);
+        }
+        if (!lazy_compute_) {
+            lazy_compute_failed_ = true;
+            std::fprintf(stderr, "[rt] d3d12: compute pipeline %s could not be built at its first dispatch\n",
+                         compute_entry_->name.c_str());
+        }
+        return lazy_compute_;
+    }
 
     // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined.
     VkPipeline build(std::uint32_t unbound) const {
@@ -4427,9 +4697,33 @@ private:
             dynamic.pDynamicStates = dynamic_states;
         }
 
+        // LEONIDA_LAZY_PSO: stages without a module get one from the library's words for this pipeline only.
+        std::vector<VkPipelineShaderStageCreateInfo> stages = r.stages;
+        struct ModuleCleanup {
+            const PipelineState& self;
+            std::vector<VkShaderModule> modules;
+            ~ModuleCleanup() {
+                for (VkShaderModule m : modules)
+                    self.device_.context->vk.vkDestroyShaderModule(self.device_.info.device, m, nullptr);
+            }
+        } cleanup{*this, {}};
+        if (!r.lazy_modules.empty()) {
+            const leonida::ShaderLibrary* library = device_.library();
+            if (!library) return VK_NULL_HANDLE;
+            for (const auto& [index, entry] : r.lazy_modules) {
+                const VkShaderModule module = make_module(library->spirv(entry));
+                if (!module) {
+                    std::fprintf(stderr, "[rt] d3d12: no shader module for %s at pipeline build\n", entry.name.c_str());
+                    return VK_NULL_HANDLE;
+                }
+                cleanup.modules.push_back(module);
+                stages[index].module = module;
+            }
+        }
+
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
-        info.stageCount = std::uint32_t(r.stages.size());
-        info.pStages = r.stages.data();
+        info.stageCount = std::uint32_t(stages.size());
+        info.pStages = stages.data();
         info.pVertexInputState = r.mesh ? nullptr : &vertex_input;  // ignored with a mesh stage; null for clarity
         info.pInputAssemblyState = r.mesh ? nullptr : &r.assembly;
         info.pViewportState = &viewport;
@@ -4472,6 +4766,10 @@ private:
     Recipe recipe_;
     std::mutex variants_mutex_;
     std::map<std::uint32_t, VkPipeline> variants_;
+    std::unique_ptr<leonida::ShaderEntry> compute_entry_;  // LEONIDA_LAZY_PSO: what the first dispatch compiles
+    VkPipeline lazy_compute_ = VK_NULL_HANDLE;
+    bool lazy_compute_failed_ = false;
+    leonida::SubgroupRequest compute_subgroup_{};  // decided at creation, applied by compile_compute
     VkShaderModule module_ = VK_NULL_HANDLE;
     std::vector<VkShaderModule> modules_;
     VkDeviceSize code_base_ = 0;
@@ -5736,6 +6034,45 @@ public:
         state_.context->set_heap_base(arena.address);
         state_.context->set_zero_page(arena.buffer, 0, kZeroPage);
         state_.context->set_quad_indices(arena.buffer, kZeroPage, kQuadIndexCount);
+        // Test branch, from draft PR 321 (237f9e0ba, Mumogg): vertex and index views that name the title's own CPU
+        // memory are copied into a 16 MiB ring carved from the arena at replay. Not fence-tracked: the ring is large
+        // against a frame's immediate geometry. The retail title draws a menu-stage batch from such views; without
+        // this every such batch failed ("unknown resource", vulkan_replay.h) and nothing of it was submitted.
+        state_.context->set_title_memory(
+            [st = &state_](std::uint64_t va, std::uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) {
+                static constexpr VkDeviceSize kRing = 16ull << 20;
+                static std::mutex mutex;
+                static VkDeviceSize ring_base = 0, ring_next = 0;
+                static bool tried = false, logged = false;
+                if (!va || !size || size > kRing / 4 || !st->arena.mapped) return false;
+                for (std::uint64_t at = va; at < va + size;) {  // the whole range: committed, readable host memory
+                    MEMORY_BASIC_INFORMATION info{};
+                    if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info))) return false;
+                    if (info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !info.Protect)
+                        return false;
+                    at = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
+                }
+                std::lock_guard lock(mutex);
+                if (!tried) {
+                    tried = true;
+                    if (!st->arena_allocate(kRing, 256, ring_base, DeviceState::arena_shader)) ring_base = 0;
+                }
+                if (!ring_base) return false;
+                const VkDeviceSize aligned = (size + 255) & ~VkDeviceSize(255);
+                if (ring_next + aligned > kRing) ring_next = 0;
+                std::memcpy(st->arena.mapped + ring_base + ring_next, reinterpret_cast<const void*>(va),
+                            std::size_t(size));
+                buffer = st->arena.buffer;
+                offset = ring_base + ring_next;
+                ring_next += aligned;
+                if (!logged) {
+                    logged = true;
+                    std::fprintf(stderr, "[rt] d3d12: vertex/index views in title memory are copied into a %llu MiB "
+                                         "ring (test branch, from PR 321; first: %llu bytes)\n",
+                                 static_cast<unsigned long long>(kRing >> 20), static_cast<unsigned long long>(size));
+                }
+                return true;
+            });
         return true;
     }
 
@@ -6477,7 +6814,26 @@ public:
         *out = nullptr;
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
         PipelineStream stream;
-        if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return d3d12_trace::result(method, hr);
+        HRESULT parsed = parse_pipeline_stream(*desc, stream);
+        // A stream the PC reading refuses, or leaves with an AS and no MS (no valid PC stream), is read again with the
+        // console's numbering (parse_pipeline_stream), and that reading is taken when it holds a mesh shader (its 24)
+        // and no AS. A stream the PC reading accepts as valid is never read differently. LEONIDA_XS_STREAM_ENUM=pc
+        // keeps the PC reading alone (such PSOs are then refused, as before).
+        if ((FAILED(parsed) || (stream.as.pShaderBytecode && !stream.ms.pShaderBytecode)) &&
+            console_stream_enum_enabled()) {
+            PipelineStream console;
+            if (SUCCEEDED(parse_pipeline_stream(*desc, console, true)) && console.ms.pShaderBytecode &&
+                !console.as.pShaderBytecode) {
+                static std::atomic<unsigned> renumbered{0};
+                if (renumbered.fetch_add(1, std::memory_order_relaxed) == 0)
+                    std::fprintf(stderr, "[rt] d3d12: a pipeline stream the PC numbering cannot read (an AS and no MS, "
+                                         "or refused) is read with the console's subobject numbering (its 24 is the "
+                                         "mesh shader); LEONIDA_XS_STREAM_ENUM=pc turns this off\n");
+                stream = console;
+                parsed = S_OK;
+            }
+        }
+        if (FAILED(parsed)) return d3d12_trace::result(method, parsed);
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
@@ -6493,8 +6849,10 @@ public:
         return kDescriptorSize;
     }
 
-    void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
+    void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc_in,
                                                   D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        D3D12_RENDER_TARGET_VIEW_DESC desc_copy;  // test branch: console formats (pc_alias_format)
+        const D3D12_RENDER_TARGET_VIEW_DESC* desc = pc_alias_desc(desc_in, desc_copy);
         d3d12_trace::record("ID3D12Device::CreateRenderTargetView");
         if (!destination.ptr) return;
         leonida::TargetView view{};
@@ -6625,7 +6983,25 @@ public:
                 } else if (requested != rd.Format) {
                     view = {}; // No typed-resource format casting is advertised by this backend.
                 }
-                if (!view.resource) log_once("unsupported typeless or RGBA8 RTV format/subresource:", int(requested));
+                if (!view.resource) {
+                    log_once("unsupported typeless or RGBA8 RTV format/subresource:", int(requested));
+                    // Test branch: which case refused it, once per (view format, resource format, view dimension).
+                    static std::mutex rtv_mutex;
+                    static std::set<std::tuple<int, int, int>> rtv_seen;
+                    const int dim = desc ? int(desc->ViewDimension) : -1;
+                    bool first = false;
+                    {
+                        std::lock_guard lock(rtv_mutex);
+                        first = rtv_seen.insert({int(requested), int(rd.Format), dim}).second;
+                    }
+                    if (first)
+                        std::fprintf(stderr, "[rt] d3d12:   refused RTV: view format %d on resource format %d, flags 0x%x, "
+                                             "dimension %d, view dimension %d, %llux%u x%u, mips %u, samples %u "
+                                             "(test branch)\n",
+                                     int(requested), int(rd.Format), unsigned(rd.Flags), int(rd.Dimension), dim,
+                                     static_cast<unsigned long long>(rd.Width), rd.Height, rd.DepthOrArraySize,
+                                     rd.MipLevels, rd.SampleDesc.Count);
+                }
             }
         } else if (resource) {
             stub("ID3D12Device::CreateRenderTargetView(resource from another device)");
@@ -6633,8 +7009,10 @@ public:
         std::memcpy(reinterpret_cast<void*>(destination.ptr), &view, sizeof(view));
     }
 
-    void STDMETHODCALLTYPE CreateDepthStencilView(ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
+    void STDMETHODCALLTYPE CreateDepthStencilView(ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc_in,
                                                   D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        D3D12_DEPTH_STENCIL_VIEW_DESC desc_copy;  // test branch: console formats (pc_alias_format)
+        const D3D12_DEPTH_STENCIL_VIEW_DESC* desc = pc_alias_desc(desc_in, desc_copy);
         d3d12_trace::record("ID3D12Device::CreateDepthStencilView");
         if (!destination.ptr) return;
         leonida::TargetView view{};
@@ -6722,8 +7100,10 @@ public:
     // dwords through its descriptor table and finds the image by them. A buffer SRV writes a 16-byte GFX10 V# in the
     // first half of the slot (raw, structured, or typed). A slot left as zeros is a null descriptor.
     void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource* resource,
-                                                    const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
+                                                    const D3D12_SHADER_RESOURCE_VIEW_DESC* desc_in,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        D3D12_SHADER_RESOURCE_VIEW_DESC desc_copy;  // test branch: console formats (pc_alias_format)
+        const D3D12_SHADER_RESOURCE_VIEW_DESC* desc = pc_alias_desc(desc_in, desc_copy);
         d3d12_trace::record("ID3D12Device::CreateShaderResourceView");
         using leonida::gfx10::ImageType;
         if (!destination.ptr) return;
@@ -6977,8 +7357,10 @@ public:
 
     // An unordered-access view of a texture is a T# too, of one mip; set 0 also holds it as a storage image.
     void STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D12Resource* resource, ID3D12Resource* counter,
-                                                     const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
+                                                     const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc_in,
                                                      D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC desc_copy;  // test branch: console formats (pc_alias_format)
+        const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc = pc_alias_desc(desc_in, desc_copy);
         d3d12_trace::record("ID3D12Device::CreateUnorderedAccessView");
         if (!destination.ptr) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
@@ -7437,9 +7819,15 @@ public:
         }
     }
 
-    HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, std::uint32_t layout, REFIID riid,
+    HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc_in, std::uint32_t layout, REFIID riid,
                                    void** out) {
         constexpr auto method = "Xbox CreatePlacedResourceX (device slot 133)";
+        // Test branch: a console depth-stencil texture may allow unordered access, the PC one may not (the slot 25 / 76
+        // stand-in, d3d12_xs_desc_clean.h): the committed fallback below refused it, and the retail title asserted on
+        // the null resource (game+0x14a6354).
+        D3D12_RESOURCE_DESC desc = desc_in;
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+            desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
             // A texture is not placed on the title's pages yet: it gets an ordinary committed DEFAULT texture of the
             // same description, as slot 76 gives one, so the title has its resource instead of asserting (found in
@@ -7605,8 +7993,14 @@ public:
     // multiple of its GetResourceAllocationInfo alignment (4 KiB for a small texture), in a heap aligned at least
     // as much, and the whole resource inside the heap. Only then is a null output E_UNEXPECTED, with nothing made.
     HRESULT create_placed(const char* method, ID3D12Heap* heap_interface, UINT64 heap_offset,
-                          const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
-                          UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out) {
+                          const D3D12_RESOURCE_DESC* desc_in, D3D12_RESOURCE_STATES state,
+                          const D3D12_CLEAR_VALUE* clear_in, UINT32 castable_count, const DXGI_FORMAT* castable,
+                          REFIID riid, void** out) {
+        D3D12_RESOURCE_DESC desc_copy;  // test branch: console formats (pc_alias_format)
+        D3D12_CLEAR_VALUE clear_copy;
+        const D3D12_RESOURCE_DESC* desc = pc_alias_desc(desc_in, desc_copy);
+        const D3D12_CLEAR_VALUE* clear = pc_alias_desc(clear_in, clear_copy);
+        state = depth_uav_stand_in_state(desc, state);
         if (out) *out = nullptr;
         auto* heap = Heap::from<Heap>(heap_interface);
         if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
@@ -7727,9 +8121,11 @@ public:
     // Footprints for copies through a buffer: rows padded to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (512 for planar
     // depth-stencil), subresources placed at D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, block-compressed sizes rounded up to whole blocks, depth-stencil
     // formats as two planes. d3d12_vulkan_device_test compares every output with the PC runtime's.
-    void STDMETHODCALLTYPE GetCopyableFootprints(const D3D12_RESOURCE_DESC* desc, UINT first, UINT count, UINT64 base,
+    void STDMETHODCALLTYPE GetCopyableFootprints(const D3D12_RESOURCE_DESC* desc_in, UINT first, UINT count, UINT64 base,
                                                  D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, UINT* rows,
                                                  UINT64* row_sizes, UINT64* total) override {
+        D3D12_RESOURCE_DESC desc_copy;  // test branch: console formats (pc_alias_format)
+        const D3D12_RESOURCE_DESC* desc = pc_alias_desc(desc_in, desc_copy);
         const auto fail = [&] {
             for (UINT i = 0; i < count; ++i) {
                 if (layouts) std::memset(&layouts[i], 0xff, sizeof(layouts[i]));
@@ -8629,7 +9025,9 @@ private:
     }
 
     // One resource's size and alignment, or kInvalidAllocation for a description D3D12 (or this device) rejects.
-    D3D12_RESOURCE_ALLOCATION_INFO allocation(const D3D12_RESOURCE_DESC& desc) const {
+    D3D12_RESOURCE_ALLOCATION_INFO allocation(const D3D12_RESOURCE_DESC& desc_in) const {
+        D3D12_RESOURCE_DESC desc = desc_in;  // test branch: console formats (pc_alias_format)
+        desc.Format = pc_alias_format(desc.Format);
         constexpr UINT64 align_4k = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT,
                          align_64k = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
                          align_msaa_64k = D3D12_SMALL_MSAA_RESOURCE_PLACEMENT_ALIGNMENT,
@@ -8810,9 +9208,14 @@ private:
     // Validation shared by CreateCommittedResource and CreateCommittedResource3; internal callers pass null `method`
     // to skip trace recording.
     HRESULT create_committed_validated(const char* method, const D3D12_HEAP_PROPERTIES* heap,
-                                       D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* desc,
-                                       D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
+                                       D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* desc_in,
+                                       D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear_in,
                                        UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out) {
+        D3D12_RESOURCE_DESC desc_copy;  // test branch: console formats (pc_alias_format)
+        D3D12_CLEAR_VALUE clear_copy;
+        const D3D12_RESOURCE_DESC* desc = pc_alias_desc(desc_in, desc_copy);
+        const D3D12_CLEAR_VALUE* clear = pc_alias_desc(clear_in, clear_copy);
+        state = depth_uav_stand_in_state(desc, state);
         const auto finish = [&](HRESULT hr) { return method ? d3d12_trace::result(method, hr) : hr; };
         if (out) *out = nullptr;
         if (!heap || !desc) return finish(E_INVALIDARG);
@@ -8821,6 +9224,19 @@ private:
             log_once((std::string(method ? method : "CreateCommittedResource") + " refused (" + why + "), dimension")
                          .c_str(),
                      int(desc->Dimension));
+            static std::mutex refused_mutex;
+            static std::set<std::pair<int, unsigned>> refused_seen;
+            bool first = false;
+            {
+                std::lock_guard lock(refused_mutex);
+                first = refused_seen.insert({int(desc->Format), unsigned(desc->Flags)}).second;
+            }
+            if (first)
+                std::fprintf(stderr,
+                             "[rt] d3d12:   refused committed resource: format %d flags 0x%x state 0x%x %llux%u "
+                             "(test branch, once per format and flags)\n",
+                             int(desc->Format), unsigned(desc->Flags), unsigned(state),
+                             static_cast<unsigned long long>(desc->Width), desc->Height);
             return finish(E_INVALIDARG);
         }
         // The sample quality is checked above as the host does it here: CreateCommittedResource accepts a quality on a
@@ -8962,9 +9378,13 @@ private:
     // compare_placed_reserved, RTX 3060 / 610.88): the description, initial state and clear value rules of a
     // committed resource on a default heap, the reserved layouts below, and only then E_UNEXPECTED for a null
     // output, with nothing made.
-    HRESULT create_reserved(const char* method, const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
-                            const D3D12_CLEAR_VALUE* clear, UINT32 castable_count, const DXGI_FORMAT* castable,
+    HRESULT create_reserved(const char* method, const D3D12_RESOURCE_DESC* desc_in, D3D12_RESOURCE_STATES state,
+                            const D3D12_CLEAR_VALUE* clear_in, UINT32 castable_count, const DXGI_FORMAT* castable,
                             REFIID riid, void** out) {
+        D3D12_RESOURCE_DESC desc_copy;  // test branch: console formats (pc_alias_format)
+        D3D12_CLEAR_VALUE clear_copy;
+        const D3D12_RESOURCE_DESC* desc = pc_alias_desc(desc_in, desc_copy);
+        const D3D12_CLEAR_VALUE* clear = pc_alias_desc(clear_in, clear_copy);
         if (out) *out = nullptr;
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
         if (castable_count && castable && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {

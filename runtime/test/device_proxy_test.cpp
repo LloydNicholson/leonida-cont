@@ -1193,15 +1193,15 @@ int main(int argc, char** argv) {
 
         // Element 0 @ 0x54: "POSITION\0" (9 B) + 28 B fields @ 0x5d..0x79
         std::memcpy(blob188 + 0x54, "POSITION", 9);
-        put_u32(blob188, 0x5d + 0x00, 0u);                                    // InputSlot 0
+        put_u32(blob188, 0x5d + 0x00, 0u);                                    // SemanticIndex 0
         put_u32(blob188, 0x5d + 0x04, static_cast<std::uint32_t>(DXGI_FORMAT_R32G32B32_FLOAT));  // 6
-        put_u32(blob188, 0x5d + 0x08, 0u);                                    // SemanticIndex 0
+        put_u32(blob188, 0x5d + 0x08, 0u);                                    // InputSlot 0
         put_u32(blob188, 0x5d + 0x0c, 0u);                                    // AlignedByteOffset 0
         put_u32(blob188, 0x5d + 0x18, 6u);
 
         // Element 1 @ 0x79: "COLOR\0" (6 B) + 28 B fields @ 0x7f..0x9b
         std::memcpy(blob188 + 0x79, "COLOR", 6);
-        put_u32(blob188, 0x7f + 0x00, 0u);
+        put_u32(blob188, 0x7f + 0x00, 1u);  // SemanticIndex 1: the retail boot's second COLOR element has 1 here
         put_u32(blob188, 0x7f + 0x04, static_cast<std::uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM));   // 28
         put_u32(blob188, 0x7f + 0x08, 0u);
         put_u32(blob188, 0x7f + 0x0c, 12u);
@@ -1235,8 +1235,9 @@ int main(int argc, char** argv) {
                           elems[0].aligned_byte_offset == 0 && elems[0].input_slot == 0,
                       "slot 57 pipeline blob element 0 is POSITION R32G32B32_FLOAT @0");
                 check(elems[1].semantic_name == "COLOR" && elems[1].format == DXGI_FORMAT_R8G8B8A8_UNORM &&
-                          elems[1].aligned_byte_offset == 12 && elems[1].input_slot == 0,
-                      "slot 57 pipeline blob element 1 is COLOR R8G8B8A8_UNORM @12");
+                          elems[1].aligned_byte_offset == 12 && elems[1].input_slot == 0 &&
+                          elems[1].semantic_index == 1,
+                      "slot 57 pipeline blob element 1 is COLOR1 R8G8B8A8_UNORM @12 in slot 0 (+0x00 is the index)");
                 check(elems[2].semantic_name == "TEXCOORD" && elems[2].format == DXGI_FORMAT_R32G32_FLOAT &&
                           elems[2].aligned_byte_offset == 16 && elems[2].input_slot == 0,
                       "slot 57 pipeline blob element 2 is TEXCOORD R32G32_FLOAT @16");

@@ -131,6 +131,10 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
                                     const XboxPresentParameters* params) {
     std::lock_guard serialise(present_mutex_);
     if (plane_count > 2 || (plane_count && !planes)) return E_INVALIDARG;
+    if (draw_diag::enabled())  // test-branch diagnostic
+        draw_diag::report_present(plane_count, plane_count && planes[0].ppResources && planes[0].ppResources[0]
+                                                   ? resource_id(planes[0].ppResources[0])
+                                                   : 0);
     if (pacer_.suspended()) return from_pacer(hr::invalid_state);
     // A zero, negative or NaN threshold never tears; an uncapped frame is never late for anything either.
     const float threshold = params ? params->ImmediateThresholdPercent : 0.0f;

@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <thread>
 #include <functional>
 #include <cerrno>
 #include <cstddef>
@@ -1036,6 +1037,47 @@ VOID CALLBACK on_fence_progress(PTP_CALLBACK_INSTANCE, PVOID context, PTP_WAIT, 
     ReleaseSRWLockExclusive(&mirror->lock);
 }
 
+// Test branch: one poller thread refreshes every mirror each millisecond, in place of a thread-pool wait per fence
+// re-armed every 10 ms. In a retail boot under Wine (24 Nov) a thread sample during the title's hang showed the
+// fence-progress callbacks, the pool's wait-queue thread and a duplicated-handle close all queued on Wine's wait-queue
+// lock, and the title's hang check ended the process (null write at game+0x2215c35). LEONIDA_FENCE_MIRROR=tp keeps
+// the thread-pool waits.
+bool fence_mirror_poller() {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_FENCE_MIRROR");
+        return !(v && std::strcmp(v, "tp") == 0);
+    }();
+    return on;
+}
+std::mutex g_mirror_mutex;  // guards g_mirrors; held while the poller refreshes, so a removed mirror is not in use
+std::vector<FenceMirror*> g_mirrors;
+
+void add_polled_mirror(FenceMirror* m) {
+    static std::once_flag started;
+    {
+        std::lock_guard lock(g_mirror_mutex);
+        g_mirrors.push_back(m);
+    }
+    std::call_once(started, [] {
+        std::thread([] {
+            for (;;) {
+                {
+                    std::lock_guard lock(g_mirror_mutex);
+                    for (FenceMirror* mirror : g_mirrors) refresh_mirror(mirror);
+                }
+                Sleep(1);
+            }
+        }).detach();
+        std::fprintf(stderr, "[rt] d3d12_xs: fence slot 12: completed values are refreshed by one poller thread every "
+                             "1 ms (test branch; LEONIDA_FENCE_MIRROR=tp for the thread-pool waits)\n");
+    });
+}
+
+void remove_polled_mirror(FenceMirror* m) {
+    std::lock_guard lock(g_mirror_mutex);
+    std::erase(g_mirrors, m);
+}
+
 // The fence's mirror, made on the first slot 12 call. Null only when it cannot be allocated.
 FenceMirror* fence_mirror(ChildProxy* self) {
     if (FenceMirror* m = self->mirror.load(std::memory_order_acquire)) return m;
@@ -1045,6 +1087,12 @@ FenceMirror* fence_mirror(ChildProxy* self) {
     if (!m && (m = new (std::nothrow) FenceMirror)) {
         m->fence = reinterpret_cast<ID3D12Fence*>(self->real);
         refresh_mirror(m);
+        if (fence_mirror_poller()) {
+            add_polled_mirror(m);
+            self->mirror.store(m, std::memory_order_release);
+            ReleaseSRWLockExclusive(&create_lock);
+            return m;
+        }
         m->event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (m->event) m->wait = CreateThreadpoolWait(on_fence_progress, m, nullptr);
         if (m->wait) {
@@ -1092,6 +1140,7 @@ void destroy_child(ChildProxy* self) {
     IUnknown* real = self->real;
     DeviceProxy* device = self->device;
     FenceMirror* mirror = self->mirror.load(std::memory_order_acquire);
+    if (mirror && fence_mirror_poller()) remove_polled_mirror(mirror);  // test branch: the poller
     if (mirror && mirror->wait) {
         AcquireSRWLockExclusive(&mirror->lock);
         mirror->stopping = true;
@@ -3203,13 +3252,17 @@ bool parse_xbox_pipeline_blob_input_layout_impl(const void* blob, std::size_t bl
         const std::size_t name_len = static_cast<const std::uint8_t*>(nul) - (bytes + pos);
         if (name_len == 0) break;
         const std::size_t fields_pos = pos + name_len + 1;
-        // Need at least the first 4 u32s (+0x00 slot, +0x04 DXGI_FORMAT, +0x08 SemanticIndex, +0x0c AlignedByteOffset)
-        // inside blob_size; never read past blob_size even when the last 1..4 bytes of the 28-byte block are truncated.
+        // Need at least the first 4 u32s (+0x00 SemanticIndex, +0x04 DXGI_FORMAT, +0x08 InputSlot, +0x0c
+        // AlignedByteOffset) inside blob_size; never read past blob_size even when the last 1..4 bytes of the 28-byte
+        // block are truncated. +0x00 is the index, not the slot: the retail boot's refused layouts read
+        // COLOR(+0x00=0, off 0), COLOR(+0x00=1, off 4), POSITION(+0x00=0, off 8), +0x08 = 0 in all three, against a
+        // vertex shader that reads COLOR0, COLOR1, POSITION0 (one interleaved 16-byte vertex). +0x18 is the next
+        // element's name length with its NUL (0 after the last).
         if (fields_pos + 16 > blob_size) break;
         std::uint32_t slot = 0, fmt = 0, sem_idx = 0, byte_off = 0;
-        read_u32(fields_pos + 0x00, slot);
+        read_u32(fields_pos + 0x00, sem_idx);
         read_u32(fields_pos + 0x04, fmt);
-        read_u32(fields_pos + 0x08, sem_idx);
+        read_u32(fields_pos + 0x08, slot);
         read_u32(fields_pos + 0x0c, byte_off);
         XboxPipelineInputElement elem;
         elem.semantic_name.assign(reinterpret_cast<const char*>(bytes + pos), name_len);
@@ -3253,6 +3306,61 @@ std::string lookup_xbox_fspx_program_stage_impl(const void* program_bytes, std::
     const std::string stage = entry ? entry->stage : std::string{};
     ReleaseSRWLockExclusive(&g_fspx_stage_lock);
     return stage;
+}
+
+// Test-branch diagnostic: a vertex program's input signature as the fspx_gfx index records it ("COLOR1@r1 ..."),
+// for the slot 57 refusal log below. Empty when the program is not in the index.
+std::string describe_fspx_input_signature(const void* program_bytes, std::size_t program_size) {
+    if (!program_bytes || !program_size || program_size > leonida::kFspxPartLimit) return {};
+    const std::span<const std::uint8_t> code{static_cast<const std::uint8_t*>(program_bytes), program_size};
+    if (!leonida::fspx_bare_program(code)) return {};
+    const std::string hash = leonida::sha256_hex(code);
+    std::string text;
+    AcquireSRWLockShared(&g_fspx_stage_lock);
+    const leonida::ShaderEntry* entry = g_fspx_stage_lib ? g_fspx_stage_lib->find_fspx_by_code(hash) : nullptr;
+    if (entry) {
+        for (const auto& e : entry->input_signature) {
+            char one[96];
+            std::snprintf(one, sizeof(one), "%s%s%u@r%u%s", text.empty() ? "" : " ", e.semantic.c_str(),
+                          e.semantic_index, e.register_index, e.system_value ? "(sv)" : "");
+            text += one;
+        }
+    }
+    ReleaseSRWLockShared(&g_fspx_stage_lock);
+    return text;
+}
+
+// Test-branch diagnostic: why a slot 57 input layout leaves a shader input unfed. Prints the pipeline blob's header
+// words, then each element as parsed and its 7 raw words after the name, so the semantic index's real offset in the
+// 28-byte block can be read off (docs/fspx.md measured +0x08 as 0 in three boot PSOs only).
+void log_slot57_input_layout(std::uint64_t call, const XboxNativeGraphicsPipelineStateDesc* d,
+                             const std::vector<XboxPipelineInputElement>& parsed, const std::string& vs_signature) {
+    const auto* bytes = static_cast<const std::uint8_t*>(d->pipeline_blob);
+    const std::size_t size = bytes ? static_cast<std::size_t>(d->pipeline_blob_size) : 0;
+    const auto word = [&](std::size_t off) -> unsigned {
+        std::uint32_t v = 0;
+        if (off + 4 <= size) std::memcpy(&v, bytes + off, 4);
+        return v;
+    };
+    std::size_t expect_38 = 4;
+    for (const auto& e : parsed) expect_38 += 28 + e.semantic_name.size() + 1;
+    std::fprintf(stderr,
+                 "[rt] d3d12_xs: slot 57 call %llu layout (test-branch diagnostic): blob %zu B, +0x10=0x%x "
+                 "+0x38=0x%x (formula 0x%zx) +0x4c=%u +0x50=%u parsed=%zu; vs signature: %s\n",
+                 static_cast<unsigned long long>(call), size, word(0x10), word(0x38), expect_38, word(0x4c),
+                 word(0x50), parsed.size(), vs_signature.empty() ? "(not in fspx_gfx)" : vs_signature.c_str());
+    std::size_t pos = 0x54;
+    for (std::size_t i = 0; i < parsed.size(); ++i) {
+        const std::size_t fields = pos + parsed[i].semantic_name.size() + 1;
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 57 call %llu   element %zu at +0x%zx %s idx=%u fmt=%d slot=%u off=%u | "
+                     "words %x %x %x %x %x %x %x\n",
+                     static_cast<unsigned long long>(call), i, pos, parsed[i].semantic_name.c_str(),
+                     parsed[i].semantic_index, int(parsed[i].format), parsed[i].input_slot,
+                     parsed[i].aligned_byte_offset, word(fields), word(fields + 4), word(fields + 8),
+                     word(fields + 12), word(fields + 16), word(fields + 20), word(fields + 24));
+        pos = fields + 28;
+    }
 }
 
 std::atomic<std::uint64_t> g_slot57_calls{0};
@@ -3455,7 +3563,21 @@ HRESULT proxy_create_graphics_pipeline_from_native_code(DeviceProxy* self, const
                          static_cast<unsigned long long>(xbox_desc->pipeline_blob_size),
                          static_cast<unsigned long long>(xbox_desc->prog_a_size),
                          static_cast<unsigned long long>(xbox_desc->prog_b_size));
+        // Test-branch diagnostic: the input layout against the vertex program's signature, for the first refusals.
+        static std::atomic<int> layout_log{0};
+        if (layout_log.fetch_add(1, std::memory_order_relaxed) < 24)
+            log_slot57_input_layout(call, xbox_desc, parsed_inputs,
+                                    pc_desc.VS.pShaderBytecode
+                                        ? describe_fspx_input_signature(pc_desc.VS.pShaderBytecode,
+                                                                        static_cast<std::size_t>(pc_desc.VS.BytecodeLength))
+                                        : std::string{});
     }
+    // Test-branch diagnostic: slot 57 totals at powers of ten (the failure lines above stop at 16).
+    static std::atomic<unsigned> made57{0}, failed57{0};
+    const unsigned n57 = (SUCCEEDED(hr) ? made57 : failed57).fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n57 == 1 || n57 == 10 || n57 == 100 || n57 == 1000 || n57 == 10000)
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 57 pipelines %s: %u (call %llu)\n",
+                     SUCCEEDED(hr) ? "created" : "failed", n57, static_cast<unsigned long long>(call));
     return hr;
 }
 
@@ -3719,7 +3841,10 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kSlot127PcResourceFlagsMask);
+    // Test branch: no unordered access on a depth-stencil texture either (without_depth_stencil_uav, as slots 25, 76
+    // and 108 do): the PC refuses that pair, and the retail title asserts on the null resource (game+0x14a6354).
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+        without_depth_stencil_uav(pc_desc.Dimension, xbox_flags & kSlot127PcResourceFlagsMask));
 
     static std::atomic<bool> logged{false};
     if (first_call(logged))
@@ -3873,6 +3998,8 @@ HRESULT proxy_create_state_object(DeviceProxy* self, const D3D12_STATE_OBJECT_DE
 // stride (sizeof(D3D12_RESOURCE_DESC)), each entry is expanded into a zeroed D3D12_RESOURCE_DESC1 with
 // SamplerFeedbackMipRegion cleared, and Xbox layout words (e.g. 0x101, 0x105) and console flag bits above the PC
 // D3D12_RESOURCE_FLAGS are normalized on the copy before the PC call.
+void log_refused_allocation(const D3D12_RESOURCE_DESC* descs, UINT count, bool console_abi);  // below
+
 std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2,
                                                   std::uint64_t a3, std::uint64_t a4, std::uint64_t a5) {
     note_slot(108);
@@ -3918,8 +4045,11 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
                 d.Layout = d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                           : D3D12_TEXTURE_LAYOUT_UNKNOWN;
             }
-            constexpr std::uint32_t kPcResourceFlagsMask = 0x1FFu;
-            d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(d.Flags) & kPcResourceFlagsMask);
+            // Test branch: the same flags as slot 25 (pc_resource_flags): the PC bits only, and no unordered access on
+            // a depth-stencil texture, which the PC refuses. The retail title asserts that this answer is below 4 GiB
+            // (game+0xabfe15), so a refusal here stopped the boot on an int3.
+            d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+                pc_resource_flags(d.Dimension, static_cast<std::uint32_t>(d.Flags)));
             cleaned[i] = d;
         }
         descs_to_pass = cleaned.data();
@@ -3933,6 +4063,12 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
     }
     *ret = device8->GetResourceAllocationInfo2(visible_mask, count, descs_to_pass, info1);
     device8->Release();
+    if (ret->SizeInBytes == UINT64_MAX && descs_to_pass) {  // test branch: say what was refused
+        std::vector<D3D12_RESOURCE_DESC> plain(count);
+        for (UINT i = 0; i < count; ++i) std::memcpy(&plain[i], &descs_to_pass[i], sizeof(D3D12_RESOURCE_DESC));
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 108 answered UINT64_MAX (mask %u, %u desc(s))\n", visible_mask, count);
+        log_refused_allocation(plain.data(), count, true);
+    }
     return reinterpret_cast<std::uint64_t>(ret);
 }
 

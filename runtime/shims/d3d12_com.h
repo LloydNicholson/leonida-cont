@@ -442,6 +442,21 @@ inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
     return reinterpret_cast<leonida::ResourceId>(resource);
 }
 
+// Test-branch diagnostic (LEONIDA_DRAW_DIAG=1): what the recorded draws and clears wrote between presents.
+namespace draw_diag {
+bool enabled();
+// outcome: 0 recorded, 1 dropped (no pipeline, layout or topology), 2 dropped (no viewport).
+void note_draw(int outcome, const leonida::TargetView* targets, UINT target_count, UINT vertices, UINT instances,
+               std::uintptr_t pipeline = 0, const leonida::TargetView* depth = nullptr,
+               const leonida::Viewport* viewport = nullptr, const leonida::VertexBufferView* vb0 = nullptr);
+// A graphics PSO's D3D state in one line, printed with the first frames' draws that use it.
+void note_pipeline(std::uintptr_t pipeline, std::string summary);
+void note_clear(leonida::ResourceId resource);
+void note_dispatch();
+// One line per present (the first 20, then every 100th); resets the counts.
+void report_present(UINT plane_count, leonida::ResourceId presented);
+}  // namespace draw_diag
+
 // A query heap's ID in the command-list IR and the VulkanContext: its pointer value, as for resources.
 inline leonida::QueryHeapId query_heap_id(const ID3D12QueryHeap* heap) {
     return reinterpret_cast<leonida::QueryHeapId>(heap);

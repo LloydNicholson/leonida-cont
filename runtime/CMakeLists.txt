@@ -1113,6 +1113,13 @@ if(BUILD_TESTING)
     add_test(NAME xs_proxy_mock_env_slots_invalid COMMAND xs_proxy_mock_test --env-slots-invalid)
     add_test(NAME xs_proxy_mock_env_slots_70 COMMAND xs_proxy_mock_test --env-slots-70)
     add_test(NAME xs_proxy_mock_env_slots_74 COMMAND xs_proxy_mock_test --env-slots-74)
+    # Test branch: the fence mirror checks are for the thread-pool waits; the branch's default is the poller.
+    get_property(_xs_mock_tests DIRECTORY PROPERTY TESTS)
+    foreach(_t IN LISTS _xs_mock_tests)
+      if(_t MATCHES "^xs_proxy_mock")
+        set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT "LEONIDA_FENCE_MIRROR=tp")
+      endif()
+    endforeach()
   endif()
   add_executable(pso_stream_test
     test/pso_stream_test.cpp
@@ -2875,6 +2882,9 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_compute COMMAND d3d12_compute_test)
       set_tests_properties(d3d12_compute PROPERTIES SKIP_RETURN_CODE 77)
+      # The same with LEONIDA_LAZY_PSO=1: pipelines built by their first dispatch, unedited stages without kept modules.
+      add_test(NAME d3d12_compute_lazy_pso COMMAND d3d12_compute_test)
+      set_tests_properties(d3d12_compute_lazy_pso PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT LEONIDA_LAZY_PSO=1)
       # Compute PSOs from FSPX programs (docs/fspx.md): an ACCC container at slot 62 and a bare kind-6 program.
       add_executable(d3d12_fspx_compute_test test/d3d12_fspx_compute_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_TEST_CS})
       target_link_libraries(d3d12_fspx_compute_test PRIVATE gta6rt_d3d12_com)
@@ -2914,6 +2924,9 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_draw COMMAND d3d12_draw_test)
       set_tests_properties(d3d12_draw PROPERTIES SKIP_RETURN_CODE 77)
+      # The same with LEONIDA_LAZY_PSO=1: pipelines built by their first draw, unedited stages without kept modules.
+      add_test(NAME d3d12_draw_lazy_pso COMMAND d3d12_draw_test)
+      set_tests_properties(d3d12_draw_lazy_pso PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT LEONIDA_LAZY_PSO=1)
       # Graphics & compute PSO descriptor validation parity against live Windows D3D12 (WARP and HW).
       add_executable(d3d12_pso_validation_test test/d3d12_pso_validation_test.cpp ${LEONIDA_TEST_VS}
                      ${LEONIDA_TEST_PS} ${LEONIDA_TEST_PS_UINT} ${LEONIDA_TEST_VS_FULLSCREEN} ${LEONIDA_TEST_CS})
@@ -3126,6 +3139,9 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_mesh_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_mesh COMMAND d3d12_mesh_test)
       set_tests_properties(d3d12_mesh PROPERTIES SKIP_RETURN_CODE 77)
+      # The same with LEONIDA_LAZY_PSO=1: pipelines built by their first draw, unedited stages without kept modules.
+      add_test(NAME d3d12_mesh_lazy_pso COMMAND d3d12_mesh_test)
+      set_tests_properties(d3d12_mesh_lazy_pso PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT LEONIDA_LAZY_PSO=1)
     else()
       message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test, d3d12_set0_compute_test and d3d12_mesh_test are not built")
     endif()
